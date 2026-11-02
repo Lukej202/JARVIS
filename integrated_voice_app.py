@@ -1,212 +1,110 @@
-"""JARVIS local voice interface: browser microphone -> Whisper -> Ollama agent.
+"""JARVIS Control Center: local Flask GUI for the shared Ollama agent.
 
-Requires jarvis_agent.py to be import-safe: its interactive loop must be under
-`if __name__ == "__main__":`.
-
-This voice entrypoint deliberately exposes only the existing Calculator and
-Notepad tools. Other tools need purpose-built approval flows before being
-called from a web request.
+Keeps the existing voice, memory, tool and approval behavior; HTML/CSS/JS
+live under templates/ and static/ to make future GUI work maintainable.
 """
-
 from io import BytesIO
+import json
 from pathlib import Path
+import secrets
+import shutil
 from threading import Lock
+from urllib.error import URLError
+from urllib.request import urlopen
 
-from agents import (
-    Agent,
-    AsyncOpenAI,
-    OpenAIChatCompletionsModel,
-    Runner,
-    SQLiteSession,
-    set_tracing_disabled,
-)
 from faster_whisper import WhisperModel
-from flask import Flask, jsonify, render_template_string, request
-from jarvis_agent import open_calculator, open_notepad
+from flask import Flask, jsonify, render_template, request
 
-app = Flask(__name__)
+from jarvis_core import (
+    MODEL_NAME, VISION_MODEL, decide_action, pending_actions,
+    recent_actions, recent_messages, run_turn,
+)
+
+ROOT = Path(__file__).resolve().parent
+app = Flask(__name__, template_folder=str(ROOT / "templates"),
+            static_folder=str(ROOT / "static"))
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
-
-# All reasoning stays on the local Ollama server. Disable OpenAI tracing.
-set_tracing_disabled(True)
-local_client = AsyncOpenAI(
-    base_url="http://127.0.0.1:11434/v1/",
-    api_key="ollama",  # required by the client, ignored by local Ollama
-    timeout=90.0,
-    max_retries=0,
-)
-
-voice_agent = Agent(
-    name="JARVIS",
-    instructions=(
-        "You are JARVIS, a concise, courteous personal desktop assistant. "
-        "The user is speaking to you. Use a registered tool when the user "
-        "asks to open Notepad or Calculator. You may use both if requested. "
-        "You have no other computer control or file tools in this voice mode. "
-        "Do not claim you clicked, typed, saved, or verified a window when "
-        "you have not actually done so. Reply briefly for spoken playback."
-    ),
-    model=OpenAIChatCompletionsModel(
-        model="qwen3:4b", openai_client=local_client
-    ),
-    tools=[open_notepad, open_calculator],
-)
-
-voice_session = SQLiteSession(
-    "jarvis_voice", str(Path(__file__).with_name("jarvis_voice_memory.db"))
-)
-agent_lock = Lock()  # Prevent simultaneous turns using the same session.
-whisper_model = None
-whisper_lock = Lock()
+TOKEN = secrets.token_urlsafe(32)
+_whisper = None
+_whisper_lock = Lock()
 
 
 def get_whisper_model():
-    global whisper_model
-    with whisper_lock:
-        if whisper_model is None:
+    global _whisper
+    with _whisper_lock:
+        if _whisper is None:
             print("JARVIS: Loading local Whisper...", flush=True)
-            whisper_model = WhisperModel(
-                "base.en", device="cpu", compute_type="int8"
-            )
+            _whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
             print("JARVIS: Whisper ready.", flush=True)
-    return whisper_model
+    return _whisper
 
 
-PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JARVIS Voice</title>
-  <style>
-    body { background:#101820; color:#e7f5ff; font-family:Arial,sans-serif;
-           text-align:center; padding:56px 20px; }
-    h1 { color:#4fc3f7; letter-spacing:4px; }
-    button { padding:14px 25px; margin:8px; cursor:pointer;
-             border-radius:8px; border:0; font-size:15px; }
-    button:disabled { opacity:.5; cursor:not-allowed; }
-    audio { display:block; margin:22px auto; max-width:100%; }
-    .panel { background:#1b2b38; border-radius:8px; padding:18px;
-             max-width:660px; margin:14px auto; min-height:30px;
-             overflow-wrap:anywhere; }
-    .muted { color:#adc6d7; font-size:14px; }
-  </style>
-</head>
-<body>
-  <h1>J.A.R.V.I.S.</h1>
-  <p id="status">Local voice interface ready.</p>
-  <button id="start">Start Recording</button>
-  <button id="stop" disabled>Stop Recording</button>
-  <audio id="playback" controls></audio>
-  <h3>What JARVIS heard</h3>
-  <p class="panel" id="transcript">Nothing yet...</p>
-  <h3>JARVIS responds</h3>
-  <p class="panel" id="reply">Ready.</p>
-  <p class="muted">Voice recognition and reasoning run locally.</p>
-  <script>
-    let recorder, stream, chunks = [], audioUrl = null;
-    const start = document.getElementById("start");
-    const stop = document.getElementById("stop");
-    const status = document.getElementById("status");
-    const playback = document.getElementById("playback");
-    const transcript = document.getElementById("transcript");
-    const reply = document.getElementById("reply");
+def _check_local_token():
+    return secrets.compare_digest(request.headers.get("X-JARVIS-Token", ""), TOKEN)
 
-    function speak(text) {
-      if (!('speechSynthesis' in window)) return;
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.0;
-      utterance.pitch = 0.9;
-      window.speechSynthesis.speak(utterance);
-    }
 
-    start.onclick = async () => {
-      start.disabled = true;
-      transcript.textContent = "Nothing yet...";
-      try {
-        window.speechSynthesis?.cancel();
-        stream = await navigator.mediaDevices.getUserMedia({audio:true});
-        chunks = [];
-        recorder = new MediaRecorder(stream);
-        recorder.ondataavailable = event => {
-          if (event.data.size > 0) chunks.push(event.data);
-        };
-        recorder.onstop = async () => {
-          stream.getTracks().forEach(track => track.stop());
-          stop.disabled = true;
-          const audio = new Blob(chunks, {type: recorder.mimeType});
-          if (audioUrl) URL.revokeObjectURL(audioUrl);
-          audioUrl = URL.createObjectURL(audio);
-          playback.src = audioUrl;
-          if (audio.size === 0) {
-            status.textContent = "Recording was empty.";
-            start.disabled = false;
-            return;
-          }
-          status.textContent = "Transcribing locally...";
-          const form = new FormData();
-          const filename = audio.type.includes("mp4") ? "recording.mp4" : "recording.webm";
-          form.append("audio", audio, filename);
-          try {
-            const tr = await fetch("/transcribe", {method:"POST", body:form});
-            const t = await tr.json();
-            if (!tr.ok) throw new Error(t.error || "Transcription failed");
-            transcript.textContent = t.text || "No speech detected.";
-            if (!t.text) {
-              status.textContent = "No speech detected.";
-              return;
-            }
-            status.textContent = "Asking local JARVIS...";
-            const ar = await fetch("/command", {
-              method:"POST",
-              headers:{"Content-Type":"application/json"},
-              body:JSON.stringify({text:t.text})
-            });
-            const answer = await ar.json();
-            if (!ar.ok) throw new Error(answer.error || "JARVIS request failed");
-            reply.textContent = answer.reply;
-            status.textContent = "Ready.";
-            speak(answer.reply);
-          } catch (error) {
-            status.textContent = "Error: " + error.message;
-            reply.textContent = "Check the Flask terminal for details.";
-          } finally {
-            start.disabled = false;
-          }
-        };
-        recorder.start();
-        status.textContent = "Listening...";
-        stop.disabled = false;
-      } catch (error) {
-        status.textContent = "Microphone error: " + error.message;
-        if (stream) stream.getTracks().forEach(track => track.stop());
-        start.disabled = false;
-      }
-    };
-
-    stop.onclick = () => {
-      if (recorder && recorder.state === "recording") {
-        stop.disabled = true;
-        recorder.stop();
-      }
-    };
-  </script>
-</body>
-</html>
-"""
+@app.after_request
+def response_headers(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 @app.get("/")
 def home():
-    return render_template_string(PAGE)
+    return render_template("index.html", token=TOKEN)
+
+
+@app.get("/status")
+def status():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    ollama_online = False
+    model_ready = False
+    vision_ready = False
+    try:
+        with urlopen("http://127.0.0.1:11434/api/tags", timeout=2) as res:
+            data = json.load(res)
+        ollama_online = True
+        names = {model.get("name", "") for model in data.get("models", [])}
+        model_ready = MODEL_NAME in names
+        vision_ready = VISION_MODEL in names
+    except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        pass
+    return jsonify(
+        ollama="ready" if model_ready else ("model_missing" if ollama_online else "offline"),
+        model=MODEL_NAME,
+        vision="ready" if vision_ready else "not_installed",
+        whisper="ready" if _whisper is not None else "standby",
+        windows="ready" if shutil.which("calc.exe") else "unknown",
+    )
+
+
+@app.get("/history")
+def history():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    try:
+        return jsonify(messages=recent_messages())
+    except Exception:
+        app.logger.exception("Could not read shared conversation history")
+        return jsonify(error="Could not load conversation history."), 500
+
+
+@app.get("/activity")
+def activity():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    return jsonify(actions=recent_actions())
 
 
 @app.post("/transcribe")
 def transcribe():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
     audio = request.files.get("audio")
-    if not audio or not audio.filename:
+    if audio is None or not audio.filename:
         return jsonify(error="No audio received."), 400
     audio_bytes = audio.read()
     if not audio_bytes:
@@ -225,22 +123,43 @@ def transcribe():
 
 @app.post("/command")
 def command():
-    body = request.get_json(silent=True) or {}
-    message = body.get("text")
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    message = (request.get_json(silent=True) or {}).get("text")
     if not isinstance(message, str) or not message.strip():
         return jsonify(error="No text command received."), 400
-    if len(message) > 1000:
-        return jsonify(error="Command is too long."), 400
     try:
-        with agent_lock:
-            result = Runner.run_sync(
-                voice_agent, message.strip(), session=voice_session, max_turns=5
-            )
-        answer = str(result.final_output or "I couldn't complete that request.")
-        return jsonify(reply=answer)
+        return jsonify(reply=run_turn(message))
+    except ValueError as error:
+        return jsonify(error=str(error)), 400
     except Exception:
         app.logger.exception("Local JARVIS agent failed")
-        return jsonify(error="Local agent failed. Is Ollama running with qwen3:4b?"), 502
+        return jsonify(error="Local JARVIS failed. Is Ollama running with qwen3:4b?"), 502
+
+
+@app.get("/pending")
+def pending():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    return jsonify(actions=pending_actions())
+
+
+@app.post("/action")
+def action():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    data = request.get_json(silent=True) or {}
+    action_id = data.get("id")
+    approved = data.get("approved")
+    if not isinstance(action_id, str) or not isinstance(approved, bool):
+        return jsonify(error="Invalid approval."), 400
+    try:
+        return jsonify(reply=decide_action(action_id, approved))
+    except ValueError as error:
+        return jsonify(error=str(error)), 400
+    except Exception:
+        app.logger.exception("Action approval failed")
+        return jsonify(error="Action failed. Check terminal."), 500
 
 
 @app.errorhandler(413)
