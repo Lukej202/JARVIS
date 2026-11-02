@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.pyc
+
+# JARVIS memory and databases
+jarvis_memory.db*
+*.db
+*.db-*
+*.sqlite*
+
+# Local files and generated content
+workspace/
+screenshots/
+*.zip
+*_backup.py
+
+# Development
+.vscode/
+.pytest_cache/
+*.log
+*.tmp
