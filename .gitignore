@@ -24,3 +24,6 @@ screenshots/
 *.log
 *.tmp
 jarvis_session.lock
+
+tts_models/
+tts_samples/

@@ -16,6 +16,10 @@
   let recording = false;
   let speechEnabled = true;
   let toastTimer = null;
+  let voiceSequence = 0;
+  let voiceController = null;
+  let voiceAudio = null;
+  let voiceAudioUrl = null;
 
   function setMode(mode, label, description) {
     document.body.dataset.mode = mode;
@@ -45,19 +49,88 @@
     if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
     return data;
   }
-  function speak(text) {
-    if (!speechEnabled || !('speechSynthesis' in window)) {
-      setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+  // Cancel both local Kokoro audio and the browser TTS fallback.
+  function stopSpeech() {
+    voiceSequence += 1;
+    if (voiceController) { voiceController.abort(); voiceController = null; }
+    if (voiceAudio) {
+      voiceAudio.pause();
+      voiceAudio.removeAttribute('src');
+      voiceAudio = null;
+    }
+    if (voiceAudioUrl) { URL.revokeObjectURL(voiceAudioUrl); voiceAudioUrl = null; }
+    window.speechSynthesis?.cancel();
+  }
+
+  function speakWithBrowser(text, sequence) {
+    if (!speechEnabled || sequence !== voiceSequence) return;
+    if (!('speechSynthesis' in window)) {
+      setMode('idle', 'SYSTEM READY', 'Voice playback unavailable.');
       return;
     }
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text.replace(/\*\*/g, '').replace(/[`#]/g, ''));
+    const clean = text.replace(/```[\s\S]*?```/g, 'Code block omitted.')
+      .replace(/\*\*/g, '').replace(/[`#]/g, '').slice(0, 1200);
+    const utterance = new SpeechSynthesisUtterance(clean);
     utterance.rate = 1.0;
     utterance.pitch = 0.9;
-    utterance.onstart = () => setMode('speaking', 'SPEAKING', 'Playing JARVIS voice response.');
-    utterance.onend = () => setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
-    utterance.onerror = () => setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+    utterance.onstart = () => {
+      if (sequence === voiceSequence) setMode('speaking', 'SPEAKING', 'Browser voice fallback active.');
+    };
+    utterance.onend = utterance.onerror = () => {
+      if (sequence === voiceSequence) setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+    };
     window.speechSynthesis.speak(utterance);
+  }
+
+  async function speak(text) {
+    stopSpeech();
+    const sequence = voiceSequence;
+    if (!speechEnabled) {
+      setMode('idle', 'SYSTEM READY', 'Voice replies muted.');
+      return;
+    }
+    const controller = new AbortController();
+    voiceController = controller;
+    setMode('thinking', 'GENERATING VOICE', 'Kokoro is generating bm_lewis speech locally...');
+    try {
+      const response = await fetch('/tts', {
+        method: 'POST', cache: 'no-store', signal: controller.signal,
+        headers: {'X-JARVIS-Token': TOKEN, 'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      if (!response.ok) throw new Error(`Kokoro returned HTTP ${response.status}`);
+      const wav = await response.blob();
+      if (!wav.size || sequence !== voiceSequence || !speechEnabled) return;
+      voiceController = null;
+      voiceAudioUrl = URL.createObjectURL(wav);
+      const player = new Audio(voiceAudioUrl);
+      voiceAudio = player;
+      player.onplaying = () => {
+        if (sequence === voiceSequence) setMode('speaking', 'SPEAKING', 'Playing Kokoro bm_lewis voice.');
+      };
+      player.onended = () => {
+        if (sequence === voiceSequence) {
+          stopSpeech();
+          setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+        }
+      };
+      player.onerror = () => {
+        if (sequence === voiceSequence) {
+          stopSpeech();
+          speakWithBrowser(text, voiceSequence);
+        }
+      };
+      await player.play();
+    } catch (error) {
+      if (error.name === 'AbortError' || sequence !== voiceSequence || !speechEnabled) return;
+      if (voiceAudio) {
+        voiceAudio.pause(); voiceAudio = null;
+      }
+      if (voiceAudioUrl) { URL.revokeObjectURL(voiceAudioUrl); voiceAudioUrl = null; }
+      voiceController = null;
+      showToast('Kokoro is unavailable. Using browser voice as fallback.', true);
+      speakWithBrowser(text, sequence);
+    }
   }
   // Render a minimal subset of Markdown without converting model text to HTML.
   function renderInline(text, target) {
@@ -129,6 +202,7 @@
   async function sendCommand(text) {
     text = String(text || '').trim();
     if (!text || busy) return;
+    stopSpeech();
     setBusy(true);
     addMessage('user', text);
     setMode('thinking', 'PROCESSING', 'Qwen3 is interpreting your request...');
@@ -165,7 +239,7 @@
     speechButton.title = speechEnabled ? 'Voice replies on' : 'Voice replies off';
     speechButton.querySelector('use').setAttribute('href', speechEnabled ? '#i-volume' : '#i-volume-off');
     if (!speechEnabled) {
-      window.speechSynthesis?.cancel();
+      stopSpeech();
       if (!busy && !recording) setMode('idle', 'SYSTEM READY', 'Voice replies muted.');
     }
   });
@@ -177,7 +251,7 @@
     }
     startButton.disabled = true;
     try {
-      window.speechSynthesis?.cancel();
+      stopSpeech();
       stream = await navigator.mediaDevices.getUserMedia({audio: true});
       pieces = [];
       recorder = new MediaRecorder(stream);
@@ -449,6 +523,6 @@
   window.addEventListener('beforeunload', () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     if (stream) stream.getTracks().forEach(t => t.stop());
-    window.speechSynthesis?.cancel();
+    stopSpeech();
   });
 })();
