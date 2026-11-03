@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JARVIS Research Tabs</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header><span class="symbol">◉</span><div><h1>JARVIS</h1><small>CHROME RESEARCH • LOCAL BRIDGE</small></div></header>
+  <main>
+    <section class="pairing">
+      <h2>CONNECT TO JARVIS</h2>
+      <label for="bridge-key">Local pairing key (from WSL terminal)</label>
+      <input id="bridge-key" type="password" autocomplete="off" placeholder="Paste pairing key here">
+      <button id="pair">CONNECT TO LOCAL JARVIS</button>
+      <div id="bridge-status">Bridge: not paired</div>
+    </section>
+    <label for="query">Research topic</label>
+    <textarea id="query" rows="2" placeholder="Affordable FPGA boards for VHDL and Verilog"></textarea>
+    <button class="primary" id="search">OPEN RESEARCH TAB</button>
+    <div class="buttons">
+      <button id="read">READ JARVIS TAB</button>
+      <button id="close">CLOSE JARVIS TABS</button>
+    </div>
+    <div id="status" role="status" aria-live="polite">Ready to create a research tab.</div>
+    <section id="page" hidden>
+      <h2>Last page read</h2>
+      <div id="title" class="page-title"></div>
+      <div id="url" class="url"></div>
+      <pre id="preview"></pre>
+      <button id="copy">COPY PAGE TEXT</button>
+      <div id="links-heading" hidden>
+        <h2>Links on this page</h2>
+        <small>Click a link to open it in another JARVIS tab.</small>
+      </div>
+      <div id="links"></div>
+    </section>
+  </main>
+  <footer>Only extension-created research tabs are accessed; never your existing tabs.</footer>
+  <script src="popup.js"></script>
+</body>
+</html>
