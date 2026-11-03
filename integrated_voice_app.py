@@ -259,7 +259,7 @@ def command():
         return jsonify(error=str(error)), 400
     except Exception:
         app.logger.exception("Local JARVIS agent failed")
-        return jsonify(error="Local JARVIS failed. Is Ollama running with qwen3:4b?"), 502
+        return jsonify(error=f"Local JARVIS failed. Is Ollama running with {MODEL_NAME}?"), 502
 
 
 @app.post("/tts")
@@ -309,6 +309,60 @@ def action():
     except Exception:
         app.logger.exception("Action approval failed")
         return jsonify(error="Action failed. Check terminal."), 500
+
+
+# M13_BROWSER_CONTROL: stop button does not wait for conversation/session locks.
+@app.post("/browser-stop")
+def browser_stop():
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    from jarvis_extension_bridge import request_stop
+    return jsonify(message=request_stop())
+
+
+# CHROME_EXTENSION_BRIDGE: independent read-only research lane for paired extension.
+# These endpoints never expose the GUI token, pairing key, or personal tabs.
+def _extension_authorized():
+    from jarvis_extension_bridge import verify_key
+    return verify_key(request.headers.get("X-JARVIS-Extension-Key", ""))
+
+
+@app.get("/extension/health")
+def extension_health():
+    if not _extension_authorized():
+        return jsonify(error="Invalid extension pairing key."), 403
+    from jarvis_extension_bridge import heartbeat
+    heartbeat()
+    return jsonify(ready=True)
+
+
+@app.get("/extension/next")
+def extension_next():
+    if not _extension_authorized():
+        return jsonify(error="Invalid extension pairing key."), 403
+    from jarvis_extension_bridge import claim_next
+    return jsonify(job=claim_next())
+
+
+@app.get("/extension/cancel/<job_id>")
+def extension_cancel(job_id):
+    if not _extension_authorized():
+        return jsonify(error="Invalid extension pairing key."), 403
+    from jarvis_extension_bridge import is_cancelled
+    return jsonify(cancelled=is_cancelled(job_id))
+
+
+@app.post("/extension/result")
+def extension_result():
+    if not _extension_authorized():
+        return jsonify(error="Invalid extension pairing key."), 403
+    from jarvis_extension_bridge import receive_result
+    body = request.get_json(silent=True) or {}
+    try:
+        accepted = receive_result(body)
+        return jsonify(accepted=accepted)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
 
 
 @app.errorhandler(413)

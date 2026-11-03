@@ -257,6 +257,28 @@ def _run_approved_action(kind: str, payload: dict) -> str:
         answer = str(result.final_output or "No summary was generated.")
         return f"Chrome tab read: {page['title']}\nSource: {page['url']}\n\n{answer}"
 
+    # M13_BROWSER_CONTROL: approved, read-only multi-page browser research.
+    if kind == "browser_research":
+        import json as _json
+        from jarvis_extension_bridge import enqueue_research
+        report = enqueue_research(payload["query"], max_pages=int(payload["pages"]))
+        sources = report.get("pages", [])
+        if not sources:
+            return ("Browser research " + ("was stopped. " if report.get("stopped") else "found no readable pages. ")
+                    + " ".join(report.get("errors", []))[:800])
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        actual_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        evidence = _json.dumps({"query": report["query"], "pages": sources}, ensure_ascii=False)
+        from jarvis_research_summarizer import summarize_research
+        answer = summarize_research(report, model=MODEL_NAME, ollama_api=OLLAMA_API)
+        prefix = "Research stopped early; partial findings below.\n" if report.get("stopped") else ""
+        errors = "\nPages that could not be read: " + "; ".join(report["errors"][:3]) if report.get("errors") else ""
+        source_list = "\n\nSources actually opened:\n" + "\n".join(
+            f"[{i}] {p['title']} — {p['url']}" for i, p in enumerate(sources, 1)
+        )
+        return prefix + answer + source_list + errors
+
     raise ValueError("Unknown action: " + kind)
 
 
@@ -443,6 +465,25 @@ def fetch_web_page(url: str) -> str:
         return f"Webpage retrieval failed: {err}"
 
 @function_tool
+def open_notepad() -> str:
+    """Launch Windows Notepad from WSL."""
+    try:
+        subprocess.Popen(["notepad.exe"])
+        _log_app_launch("Notepad", "Launch command submitted to Windows.", True)
+        return "Requested Windows Notepad launch."
+    except OSError as err:
+        _log_app_launch("Notepad", str(err), False)
+        return f"Notepad could not be opened: {err}"
+
+@function_tool
+def draw_in_notepad(text: str) -> str:
+    """Request approval to paste text into a Windows Notepad window. Not saved."""
+    if not text or len(text) > 30000:
+        return "Provide between 1 and 30,000 characters."
+    return _request_approval("draw_in_notepad", {"text": text},
+                             f"paste {len(text)} characters into Notepad")
+
+@function_tool
 def read_web_page(url: str) -> str:
     """Retrieve actual text from a public webpage."""
     return fetch_web_page(url)
@@ -602,6 +643,22 @@ def read_chrome_tab(url: str, question: str = "Summarize this webpage.") -> str:
     return request_chrome_tab_read(url, question)
 
 
+# M13_BROWSER_CONTROL: isolated Chrome public research (single task approval).
+def _queue_browser_research(query: str, pages: int = 3) -> str:
+    if not isinstance(query, str) or not (2 <= len(query.strip()) <= 220):
+        return "Please provide a research topic between 2 and 220 characters."
+    if not isinstance(pages, int) or isinstance(pages, bool) or not 1 <= pages <= 3:
+        return "Research is limited to 1–3 public pages per approved task."
+    return _request_approval("browser_research", {"query": query.strip(), "pages": pages},
+                             f"research '{query.strip()[:110]}' in JARVIS-created tabs in your current Chrome window")
+
+
+@function_tool
+def research_in_chrome(query: str, pages: int = 3) -> str:
+    """Request one approval to research up to 3 public websites in the user's regular Chrome window, through ONLY JARVIS extension-created research tabs. No forms, purchases, downloads, or personal-tab reading."""
+    return _queue_browser_research(query, pages)
+
+
 jarvis = Agent(
     name="JARVIS",
     model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=_client),
@@ -628,14 +685,16 @@ jarvis = Agent(
 
         "The search_web tool opens Google Chrome; it does not return "
         "search results or webpage contents. "
-        "The read_chrome_tab tool requests approval to inspect one public tab "
-        "that the user already opened in the separate JARVIS Chrome window. "
-        "Never claim a Chrome tab was read until the approval was executed."
+        "Never attempt to read existing personal Chrome tabs. "
+        "Research must use new tabs created by the paired extension and only after approval. "
+        "For multi-page public internet research, use research_in_chrome, which queues one approval. "
+        "It opens only JARVIS-created research tabs in the user's regular Chrome window through the paired extension. "
+        "Never claim research completed before approval. Do not log in, buy, submit forms or download."
     ),
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, read_chrome_tab
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome
     ],
 )
 
@@ -660,12 +719,22 @@ def run_turn(message: str) -> str:
     )
 
 
+    # M13_BROWSER_CONTROL: deterministic routing for explicit public research.
+    # URL reading and ordinary tool commands continue through their prior paths.
+    research_match = re.match(
+        r"^(?:jarvis[,: ]+)?(?:please\s+)?(?:research|search\s+the\s+web\s+for|look\s+online\s+for)\s+(.+)$",
+        message, re.IGNORECASE,
+    )
+    if research_match and not url_match:
+        return _queue_browser_research(research_match.group(1))
+
     # Explicit requests to read a page in Chrome require approval, rather
     # than the ordinary Python HTTP fetcher. User must supply the tab URL.
     chrome_intent = re.search(r"\b(chrome|browser tab|open tab)\b", message, re.IGNORECASE)
     if url_match and wants_read and chrome_intent:
         chrome_url = url_match.group(0).rstrip(".,;!?)]")
-        return request_chrome_tab_read(chrome_url, message)
+        return ("Reading an existing browser tab is disabled. "
+                "Ask me to research this public webpage using a new JARVIS extension tab instead.")
 
     if url_match and wants_read:
         url = url_match.group(0).rstrip(".,;!?)]")

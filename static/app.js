@@ -205,13 +205,17 @@
     stopSpeech();
     setBusy(true);
     addMessage('user', text);
-    setMode('thinking', 'PROCESSING', 'Qwen3 is interpreting your request...');
+    setMode('thinking', 'PROCESSING', 'Your local AI model is interpreting your request...');
     try {
       const result = await api('/command', {method: 'POST', json: {text}});
       addMessage('assistant', result.reply);
       await Promise.allSettled([refreshPending(), refreshActivity()]);
       await refreshHistory().catch(() => {});
-      speak(result.reply);
+      if (/^\s*Approval required for\b/i.test(String(result.reply || ''))) {
+        setMode('idle', 'APPROVAL REQUIRED', 'Review the request in the Approvals panel.');
+      } else {
+        speak(result.reply);
+      }
     } catch (error) {
       setMode('error', 'COMMAND FAILED', error.message);
       showToast(error.message, true);
@@ -220,6 +224,27 @@
       setBusy(false);
     }
   }
+  // M13_BROWSER_CONTROL: always-available emergency stop for the research task.
+  const stopBrowseButton = document.createElement('button');
+  stopBrowseButton.type = 'button';
+  stopBrowseButton.textContent = 'STOP BROWSING';
+  stopBrowseButton.title = 'Request JARVIS to stop research in extension-created Chrome tabs';
+  stopBrowseButton.className = 'button button-outline';
+  stopBrowseButton.style.borderColor = '#e78888';
+  stopBrowseButton.style.color = '#f3a6a6';
+  sendButton.parentElement.insertBefore(stopBrowseButton, sendButton);
+  stopBrowseButton.addEventListener('click', async () => {
+    stopBrowseButton.disabled = true;
+    try {
+      const data = await api('/browser-stop', {method: 'POST'});
+      showToast(data.message || 'Browser stop requested.');
+    } catch (error) {
+      showToast('Browser stop failed: ' + error.message, true);
+    } finally {
+      stopBrowseButton.disabled = false;
+    }
+  });
+
   sendButton.addEventListener('click', () => {
     const text = input.value;
     if (!text.trim()) return;
@@ -382,6 +407,33 @@
             const outcome = await api('/action', {method: 'POST', json: {id: item.id, approved}});
             showToast(outcome.reply);
             await Promise.allSettled([refreshPending(), refreshActivity(), refreshHistory()]);
+            // JARVIS_RESEARCH_SPEECH_V1: Speak after approved browser research finishes.
+            if (approved && item.kind === 'browser_research') {
+              const report = String(outcome.reply || '');
+              let spoken;
+              if (/^Action failed:/i.test(report)) {
+                spoken = 'Sir, the browser research failed. Please check the dashboard for details.';
+              } else if (/^Research stopped early/i.test(report) || /^Browser research was stopped/i.test(report)) {
+                spoken = 'Sir, the research was stopped. Any partial findings are in your dashboard.';
+              } else if (/^Browser research found no readable pages/i.test(report)) {
+                spoken = 'Sir, I could not retrieve readable research pages. Please review the dashboard.';
+              } else {
+                const highlights = report.split(/\r?\n/)
+                  .filter(line => /^\s*[-*]\s+/.test(line))
+                  .slice(0, 2)
+                  .map(line => line.replace(/^\s*[-*]\s+/, '')
+                    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1')
+                    .replace(/https?:\/\/\S+/g, '')
+                    .replace(/[*_`#]/g, '')
+                    .replace(/\s+/g, ' ').trim().slice(0, 210))
+                  .filter(Boolean);
+                spoken = highlights.length
+                  ? 'Sir, the research is complete. Here are two highlights. ' +
+                    highlights.join('. ') + '. The full report and sources are in your dashboard.'
+                  : 'Sir, the research is complete. I have placed the findings and source links in your dashboard.';
+              }
+              speak(spoken);
+            }
           } catch (error) {
             showToast(error.message, true);
             yes.disabled = false; no.disabled = false;
