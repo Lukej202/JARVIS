@@ -15,6 +15,8 @@ from urllib.request import urlopen
 from faster_whisper import WhisperModel
 from flask import Flask, jsonify, render_template, request
 
+from system_monitor import get_system_metrics
+
 from jarvis_core import (
     MODEL_NAME, VISION_MODEL, decide_action, pending_actions,
     recent_actions, recent_messages, run_turn,
@@ -90,6 +92,14 @@ def history():
     except Exception:
         app.logger.exception("Could not read shared conversation history")
         return jsonify(error="Could not load conversation history."), 500
+
+
+@app.get("/system-metrics")
+def system_metrics():
+    # Read-only monitoring endpoint. Uses the same local-session token as chat.
+    if not _check_local_token():
+        return jsonify(error="Unauthorized local request."), 403
+    return jsonify(get_system_metrics())
 
 
 @app.get("/activity")

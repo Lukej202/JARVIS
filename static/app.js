@@ -369,8 +369,68 @@
       $('runtime-chip').querySelector('.led').className = 'led fail';
     }
   }
+  let telemetryBusy = false;
+  function displayPercent(kind, value) {
+    const valid = typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100;
+    const display = valid ? Math.round(value) : '—';
+    $(kind + '-value').textContent = String(display);
+    $(kind + '-unit').hidden = !valid;
+    $(kind + '-bar').style.width = valid ? `${value}%` : '0%';
+    const progress = $(kind + '-progress');
+    if (valid) {
+      progress.setAttribute('aria-valuenow', String(Math.round(value)));
+      progress.removeAttribute('aria-valuetext');
+    } else {
+      progress.removeAttribute('aria-valuenow');
+      progress.setAttribute('aria-valuetext', 'Not available');
+    }
+  }
+  function formatGib(number) {
+    return typeof number === 'number' && Number.isFinite(number) ? number.toFixed(1) + ' GiB' : null;
+  }
+  function applyTelemetry(data) {
+    const cpu = data.cpu || {};
+    const memory = data.memory || {};
+    const gpu = data.gpu || {};
+    displayPercent('cpu', cpu.percent);
+    displayPercent('ram', memory.percent);
+    displayPercent('gpu', gpu.percent);
+    const ramUsed = formatGib(memory.used_gib);
+    const ramTotal = formatGib(memory.total_gib);
+    $('ram-detail').textContent = ramUsed && ramTotal ? `${ramUsed} / ${ramTotal} in use` : 'RAM reading unavailable';
+    const gpuMemUsed = formatGib(gpu.memory_used_gib);
+    const gpuMemTotal = formatGib(gpu.memory_total_gib);
+    $('gpu-detail').textContent = gpuMemUsed && gpuMemTotal ? `${gpuMemUsed} / ${gpuMemTotal} VRAM` : 'GPU utilization unavailable';
+    const tempOk = typeof gpu.temperature_c === 'number' && Number.isFinite(gpu.temperature_c);
+    $('temp-value').textContent = tempOk ? String(Math.round(gpu.temperature_c)) : '—';
+    $('temp-unit').hidden = !tempOk;
+    $('temp-detail').textContent = gpu.name || 'GPU temperature unavailable';
+    const state = data.status || 'unavailable';
+    const badge = $('telemetry-status');
+    badge.querySelector('.led').className = 'led ' + (state === 'ready' ? 'ok' : state === 'partial' ? 'warn' : 'fail');
+    badge.lastChild.textContent = state === 'ready' ? ' Live sensors' : state === 'partial' ? ' Partial sensors' : ' Unavailable';
+    $('telemetry-source').textContent = data.message || 'Host metrics unavailable.';
+    $('telemetry-updated').textContent = data.sampled_at ? 'SAMPLED ' + new Date(data.sampled_at * 1000).toLocaleTimeString() : 'NOT SAMPLED';
+  }
+  async function refreshTelemetry() {
+    if (telemetryBusy || document.hidden) return;
+    telemetryBusy = true;
+    try {
+      const data = await api('/system-metrics');
+      applyTelemetry(data);
+    } catch (error) {
+      applyTelemetry({status: 'unavailable', message: 'Windows host sensor request failed.'});
+    } finally {
+      telemetryBusy = false;
+    }
+  }
+  $('refresh-telemetry').addEventListener('click', () => refreshTelemetry());
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshTelemetry(); });
+  setInterval(refreshTelemetry, 7500);
+
   function refreshAll() {
     refreshStatus();
+    refreshTelemetry();
     refreshHistory().catch(error => showToast('History: ' + error.message, true));
     refreshPending().catch(error => showToast('Approvals: ' + error.message, true));
     refreshActivity().catch(error => showToast('Activity: ' + error.message, true));

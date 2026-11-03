@@ -40,6 +40,7 @@
         <a href="#conversation" class="nav-link"><svg class="icon"><use href="#i-chat"/></svg> Conversation <span class="nav-index">02</span></a>
         <a href="#approvals" class="nav-link"><svg class="icon"><use href="#i-shield"/></svg> Approvals <span class="nav-index" id="nav-approval-count">0</span></a>
         <a href="#activity" class="nav-link"><svg class="icon"><use href="#i-activity"/></svg> Activity <span class="nav-index">04</span></a>
+        <a href="#telemetry" class="nav-link"><svg class="icon"><use href="#i-cpu"/></svg> System monitor <span class="nav-index">05</span></a>
       </nav>
       <div class="sidebar-spacer"></div>
       <div class="side-label">SYSTEM DIAGNOSTICS</div>
@@ -60,7 +61,7 @@
         <div class="breadcrumb">WORKSPACE <span>/</span> <strong>COMMAND CENTER</strong></div>
         <div class="top-actions">
           <span class="runtime-chip" id="runtime-chip"><i class="led"></i><span id="runtime-label">CHECKING SYSTEM</span></span>
-          <span class="build-chip">MILESTONE <b>09</b> <span>·</span> ALPHA</span>
+          <span class="build-chip">MILESTONE <b>10</b> <span>·</span> ALPHA</span>
         </div>
       </header>
       <div class="main-content">
@@ -96,6 +97,41 @@
             <div class="chat-compose"><label for="typed" class="sr-only">Type a command to JARVIS</label><textarea id="typed" rows="2" maxlength="4000" placeholder="Ask JARVIS anything..."></textarea><div class="compose-actions"><span>ENTER to send <span class="muted-inline">· SHIFT + ENTER for newline</span></span><button id="send" class="send-button" type="button"><svg class="icon"><use href="#i-send"/></svg> Send</button></div></div>
           </section>
         </div>
+
+
+        <section class="panel telemetry-panel" id="telemetry" aria-labelledby="telemetry-title">
+          <div class="panel-header telemetry-header">
+            <div><div class="micro-heading">LIVE HOST TELEMETRY / WINDOWS</div><h2 id="telemetry-title">System monitor</h2></div>
+            <div class="telemetry-header-right"><span class="telemetry-status" id="telemetry-status"><i class="led"></i> Checking sensors</span><button type="button" class="icon-button" id="refresh-telemetry" aria-label="Refresh Windows metrics" title="Refresh Windows metrics"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+          </div>
+          <div class="telemetry-grid">
+            <article class="telemetry-card">
+              <div class="telemetry-label"><svg class="icon"><use href="#i-cpu"/></svg> WINDOWS CPU</div>
+              <div class="telemetry-value"><span id="cpu-value">—</span><small id="cpu-unit">%</small></div>
+              <div class="telemetry-track" role="progressbar" aria-label="Windows CPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Not sampled" id="cpu-progress"><span id="cpu-bar"></span></div>
+              <div class="telemetry-foot">Host utilization estimate</div>
+            </article>
+            <article class="telemetry-card">
+              <div class="telemetry-label"><svg class="icon"><use href="#i-grid"/></svg> SYSTEM RAM</div>
+              <div class="telemetry-value"><span id="ram-value">—</span><small id="ram-unit">%</small></div>
+              <div class="telemetry-track" role="progressbar" aria-label="Windows physical memory usage" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Not sampled" id="ram-progress"><span id="ram-bar"></span></div>
+              <div class="telemetry-foot" id="ram-detail">Waiting for host readings</div>
+            </article>
+            <article class="telemetry-card">
+              <div class="telemetry-label"><svg class="icon"><use href="#i-activity"/></svg> NVIDIA GPU</div>
+              <div class="telemetry-value"><span id="gpu-value">—</span><small id="gpu-unit">%</small></div>
+              <div class="telemetry-track" role="progressbar" aria-label="NVIDIA GPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Not sampled" id="gpu-progress"><span id="gpu-bar"></span></div>
+              <div class="telemetry-foot" id="gpu-detail">Waiting for GPU readings</div>
+            </article>
+            <article class="telemetry-card temperature-card">
+              <div class="telemetry-label"><svg class="icon"><use href="#i-cpu"/></svg> GPU TEMPERATURE</div>
+              <div class="telemetry-value"><span id="temp-value">—</span><small id="temp-unit">°C</small></div>
+              <div class="temp-ticks" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="telemetry-foot" id="temp-detail">Waiting for temperature</div>
+            </article>
+          </div>
+          <div class="telemetry-bottom"><span id="telemetry-source">Reading Windows host metrics through PowerShell and NVIDIA tools.</span><span id="telemetry-updated">NOT SAMPLED YET</span></div>
+        </section>
 
         <div class="lower-grid">
           <section class="panel approvals-panel" id="approvals" aria-labelledby="approvals-title"><div class="panel-header"><div><div class="micro-heading">GUARDED OPERATIONS</div><h2 id="approvals-title">Action approvals <span class="count-bubble" id="approval-count">0</span></h2></div><button type="button" class="icon-button" id="refresh-approvals" title="Refresh approvals" aria-label="Refresh approvals"><svg class="icon"><use href="#i-refresh"/></svg></button></div><div class="panel-note"><svg class="icon"><use href="#i-shield"/></svg><span>Review file changes, keyboard input and screen captures before they run.</span></div><div class="actions-container" id="actions"><div class="empty-action"><div class="empty-check"><svg class="icon"><use href="#i-check"/></svg></div><strong>No actions awaiting approval</strong><span>Protected operations will appear here.</span></div></div></section>
