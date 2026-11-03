@@ -16,6 +16,10 @@
   let recording = false;
   let speechEnabled = true;
   let toastTimer = null;
+  let voiceSequence = 0;
+  let voiceController = null;
+  let voiceAudio = null;
+  let voiceAudioUrl = null;
 
   function setMode(mode, label, description) {
     document.body.dataset.mode = mode;
@@ -45,19 +49,88 @@
     if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
     return data;
   }
-  function speak(text) {
-    if (!speechEnabled || !('speechSynthesis' in window)) {
-      setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+  // Cancel both local Kokoro audio and the browser TTS fallback.
+  function stopSpeech() {
+    voiceSequence += 1;
+    if (voiceController) { voiceController.abort(); voiceController = null; }
+    if (voiceAudio) {
+      voiceAudio.pause();
+      voiceAudio.removeAttribute('src');
+      voiceAudio = null;
+    }
+    if (voiceAudioUrl) { URL.revokeObjectURL(voiceAudioUrl); voiceAudioUrl = null; }
+    window.speechSynthesis?.cancel();
+  }
+
+  function speakWithBrowser(text, sequence) {
+    if (!speechEnabled || sequence !== voiceSequence) return;
+    if (!('speechSynthesis' in window)) {
+      setMode('idle', 'SYSTEM READY', 'Voice playback unavailable.');
       return;
     }
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text.replace(/\*\*/g, '').replace(/[`#]/g, ''));
+    const clean = text.replace(/```[\s\S]*?```/g, 'Code block omitted.')
+      .replace(/\*\*/g, '').replace(/[`#]/g, '').slice(0, 1200);
+    const utterance = new SpeechSynthesisUtterance(clean);
     utterance.rate = 1.0;
     utterance.pitch = 0.9;
-    utterance.onstart = () => setMode('speaking', 'SPEAKING', 'Playing JARVIS voice response.');
-    utterance.onend = () => setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
-    utterance.onerror = () => setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+    utterance.onstart = () => {
+      if (sequence === voiceSequence) setMode('speaking', 'SPEAKING', 'Browser voice fallback active.');
+    };
+    utterance.onend = utterance.onerror = () => {
+      if (sequence === voiceSequence) setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+    };
     window.speechSynthesis.speak(utterance);
+  }
+
+  async function speak(text) {
+    stopSpeech();
+    const sequence = voiceSequence;
+    if (!speechEnabled) {
+      setMode('idle', 'SYSTEM READY', 'Voice replies muted.');
+      return;
+    }
+    const controller = new AbortController();
+    voiceController = controller;
+    setMode('thinking', 'GENERATING VOICE', 'Kokoro is generating bm_lewis speech locally...');
+    try {
+      const response = await fetch('/tts', {
+        method: 'POST', cache: 'no-store', signal: controller.signal,
+        headers: {'X-JARVIS-Token': TOKEN, 'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      if (!response.ok) throw new Error(`Kokoro returned HTTP ${response.status}`);
+      const wav = await response.blob();
+      if (!wav.size || sequence !== voiceSequence || !speechEnabled) return;
+      voiceController = null;
+      voiceAudioUrl = URL.createObjectURL(wav);
+      const player = new Audio(voiceAudioUrl);
+      voiceAudio = player;
+      player.onplaying = () => {
+        if (sequence === voiceSequence) setMode('speaking', 'SPEAKING', 'Playing Kokoro bm_lewis voice.');
+      };
+      player.onended = () => {
+        if (sequence === voiceSequence) {
+          stopSpeech();
+          setMode('idle', 'SYSTEM READY', 'Ready for your next command.');
+        }
+      };
+      player.onerror = () => {
+        if (sequence === voiceSequence) {
+          stopSpeech();
+          speakWithBrowser(text, voiceSequence);
+        }
+      };
+      await player.play();
+    } catch (error) {
+      if (error.name === 'AbortError' || sequence !== voiceSequence || !speechEnabled) return;
+      if (voiceAudio) {
+        voiceAudio.pause(); voiceAudio = null;
+      }
+      if (voiceAudioUrl) { URL.revokeObjectURL(voiceAudioUrl); voiceAudioUrl = null; }
+      voiceController = null;
+      showToast('Kokoro is unavailable. Using browser voice as fallback.', true);
+      speakWithBrowser(text, sequence);
+    }
   }
   // Render a minimal subset of Markdown without converting model text to HTML.
   function renderInline(text, target) {
@@ -129,15 +202,20 @@
   async function sendCommand(text) {
     text = String(text || '').trim();
     if (!text || busy) return;
+    stopSpeech();
     setBusy(true);
     addMessage('user', text);
-    setMode('thinking', 'PROCESSING', 'Qwen3 is interpreting your request...');
+    setMode('thinking', 'PROCESSING', 'Your local AI model is interpreting your request...');
     try {
       const result = await api('/command', {method: 'POST', json: {text}});
       addMessage('assistant', result.reply);
       await Promise.allSettled([refreshPending(), refreshActivity()]);
       await refreshHistory().catch(() => {});
-      speak(result.reply);
+      if (/^\s*Approval required for\b/i.test(String(result.reply || ''))) {
+        setMode('idle', 'APPROVAL REQUIRED', 'Review the request in the Approvals panel.');
+      } else {
+        speak(result.reply);
+      }
     } catch (error) {
       setMode('error', 'COMMAND FAILED', error.message);
       showToast(error.message, true);
@@ -146,6 +224,27 @@
       setBusy(false);
     }
   }
+  // M13_BROWSER_CONTROL: always-available emergency stop for the research task.
+  const stopBrowseButton = document.createElement('button');
+  stopBrowseButton.type = 'button';
+  stopBrowseButton.textContent = 'STOP BROWSING';
+  stopBrowseButton.title = 'Request JARVIS to stop research in extension-created Chrome tabs';
+  stopBrowseButton.className = 'button button-outline';
+  stopBrowseButton.style.borderColor = '#e78888';
+  stopBrowseButton.style.color = '#f3a6a6';
+  sendButton.parentElement.insertBefore(stopBrowseButton, sendButton);
+  stopBrowseButton.addEventListener('click', async () => {
+    stopBrowseButton.disabled = true;
+    try {
+      const data = await api('/browser-stop', {method: 'POST'});
+      showToast(data.message || 'Browser stop requested.');
+    } catch (error) {
+      showToast('Browser stop failed: ' + error.message, true);
+    } finally {
+      stopBrowseButton.disabled = false;
+    }
+  });
+
   sendButton.addEventListener('click', () => {
     const text = input.value;
     if (!text.trim()) return;
@@ -165,7 +264,7 @@
     speechButton.title = speechEnabled ? 'Voice replies on' : 'Voice replies off';
     speechButton.querySelector('use').setAttribute('href', speechEnabled ? '#i-volume' : '#i-volume-off');
     if (!speechEnabled) {
-      window.speechSynthesis?.cancel();
+      stopSpeech();
       if (!busy && !recording) setMode('idle', 'SYSTEM READY', 'Voice replies muted.');
     }
   });
@@ -177,7 +276,7 @@
     }
     startButton.disabled = true;
     try {
-      window.speechSynthesis?.cancel();
+      stopSpeech();
       stream = await navigator.mediaDevices.getUserMedia({audio: true});
       pieces = [];
       recorder = new MediaRecorder(stream);
@@ -308,6 +407,33 @@
             const outcome = await api('/action', {method: 'POST', json: {id: item.id, approved}});
             showToast(outcome.reply);
             await Promise.allSettled([refreshPending(), refreshActivity(), refreshHistory()]);
+            // JARVIS_RESEARCH_SPEECH_V1: Speak after approved browser research finishes.
+            if (approved && item.kind === 'browser_research') {
+              const report = String(outcome.reply || '');
+              let spoken;
+              if (/^Action failed:/i.test(report)) {
+                spoken = 'Sir, the browser research failed. Please check the dashboard for details.';
+              } else if (/^Research stopped early/i.test(report) || /^Browser research was stopped/i.test(report)) {
+                spoken = 'Sir, the research was stopped. Any partial findings are in your dashboard.';
+              } else if (/^Browser research found no readable pages/i.test(report)) {
+                spoken = 'Sir, I could not retrieve readable research pages. Please review the dashboard.';
+              } else {
+                const highlights = report.split(/\r?\n/)
+                  .filter(line => /^\s*[-*]\s+/.test(line))
+                  .slice(0, 2)
+                  .map(line => line.replace(/^\s*[-*]\s+/, '')
+                    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1')
+                    .replace(/https?:\/\/\S+/g, '')
+                    .replace(/[*_`#]/g, '')
+                    .replace(/\s+/g, ' ').trim().slice(0, 210))
+                  .filter(Boolean);
+                spoken = highlights.length
+                  ? 'Sir, the research is complete. Here are two highlights. ' +
+                    highlights.join('. ') + '. The full report and sources are in your dashboard.'
+                  : 'Sir, the research is complete. I have placed the findings and source links in your dashboard.';
+              }
+              speak(spoken);
+            }
           } catch (error) {
             showToast(error.message, true);
             yes.disabled = false; no.disabled = false;
@@ -449,6 +575,6 @@
   window.addEventListener('beforeunload', () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     if (stream) stream.getTracks().forEach(t => t.stop());
-    window.speechSynthesis?.cancel();
+    stopSpeech();
   });
 })();
