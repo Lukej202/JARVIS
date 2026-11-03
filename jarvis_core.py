@@ -19,6 +19,9 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+
+from urllib.parse import quote_plus
+
 from agents import (
     Agent, AsyncOpenAI, OpenAIChatCompletionsModel, Runner,
     SQLiteSession, function_tool, set_tracing_disabled,
@@ -260,7 +263,57 @@ def _log_app_launch(label: str, result: str, success: bool) -> None:
         # App launching must not fail just because the activity log is unavailable.
         pass
 
+@function_tool
+def search_web(query: str) -> str:
+    """Open a Google search in Windows Google Chrome."""
+    if not query.strip():
+        return "Provide a search query."
 
+    chrome_paths = [
+        Path("/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+    ]
+
+    chrome = next((p for p in chrome_paths if p.is_file()), None)
+
+    if chrome is None:
+        return "Chrome wasn't found in its usual installation locations."
+    
+    url = f"https://www.google.com/search?q={quote_plus(query)}"
+
+    try:
+        subprocess.Popen([str(chrome), "--new-tab", url])
+        _log_app_launch("Chrome search", f"Searched for '{query}'", True)
+        return f"Opened Google Chrome to search for: {query}"
+    except OSError as err:
+        _log_app_launch("Chrome search", str(err), False)
+        return f"Could not launch Chrome: {err}"
+
+@function_tool
+def read_web_page(url: str) -> str:
+    """Fetch and return the text content of a web page using the local Ollama model."""
+    if not url.strip():
+        return "Provide a URL to read."
+    try:
+        body = json.dumps({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": f"Read and summarize the content of this page: {url}"}],
+            "stream": False,
+        }).encode("utf-8")
+        req = Request(
+            f"{OLLAMA_API}/api/chat", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urlopen(req, timeout=60) as res:
+            answer = json.load(res)
+        return answer.get("message", {}).get("content", "No content returned.")
+    except HTTPError as err:
+        if err.code == 404:
+            return f"Local model '{MODEL_NAME}' isn't installed. Run: ollama pull {MODEL_NAME}"
+        raise
+    except Exception as err:
+        return f"Failed to read web page: {type(err).__name__}: {err}"
+    
 @function_tool
 def open_notepad() -> str:
     """Launch Windows Notepad from WSL."""
@@ -415,7 +468,7 @@ jarvis = Agent(
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen,
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page
     ],
 )
 
