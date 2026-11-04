@@ -30,3 +30,6 @@ tts_samples/
 
 # Chrome extension private pairing secret
 .jarvis_extension_key
+
+# Local, user-approved long-term memory database
+jarvis_verified_memory.db*
