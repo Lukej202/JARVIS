@@ -20,6 +20,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import re
 
+from agents import (
+    AsyncOpenAI,
+    OpenAIChatCompletionsModel,
+    ModelSettings,
+)
+from openai.types.shared import Reasoning
+
 
 from urllib.parse import quote_plus
 
@@ -686,12 +693,26 @@ def recall_user_memory(topic: str = "") -> str:
     return "\n".join(f"[{record['id']}] {record['fact']}" for record in matches)
 
 
+# Ollama connection for JARVIS
+ollama_client = AsyncOpenAI(
+    base_url="http://127.0.0.1:11434/v1/",
+    api_key="ollama",
+)
+
+ollama_model = OpenAIChatCompletionsModel(
+    model=os.getenv("JARVIS_MODEL", "qwen3.5:4b"),
+    openai_client=ollama_client,
+)
+
+
 jarvis = Agent(
     name="JARVIS",
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=_client),
-    # Ollama /v1/chat/completions: disable Qwen thinking so output tokens
-    # are reserved for actual replies and tool calls, not just reasoning.
-    model_settings=ModelSettings(extra_args={"reasoning_effort": "none"}),
+    model=ollama_model,
+    model_settings=ModelSettings(
+        max_tokens=1536,
+        reasoning=Reasoning(effort="none"),
+    ),
+
     instructions=(
         "You are JARVIS, a friendly, concise personal desktop assistant. "
         "Use only registered tools, and never claim an action succeeded unless confirmed. "
@@ -727,7 +748,7 @@ jarvis = Agent(
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory 
     ],
 )
 
