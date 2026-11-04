@@ -748,7 +748,7 @@ jarvis = Agent(
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory 
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory
     ],
 )
 

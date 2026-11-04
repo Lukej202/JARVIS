@@ -100,25 +100,25 @@ class JarvisAPI:
         return response
 
     def speak(self, text: str) -> None:
-    	# winsound.PlaySound is synchronous by default.
-    	# No microphone is open during speech.
-    	response = self._post(
-        	"/tts",
-        	json_data={"text": text[:1000]},
-        	timeout=150
-    	)
+        # winsound.PlaySound is synchronous by default.
+        # No microphone is open during speech.
+        response = self._post(
+                "/tts",
+                json_data={"text": text[:1000]},
+                timeout=150
+        )
 
-    	if "audio/wav" not in response.headers.get(
-        	"content-type", ""
-    	).lower():
-        	raise RuntimeError(
-            	"The JARVIS /tts response was not WAV audio."
-        	)
+        if "audio/wav" not in response.headers.get(
+                "content-type", ""
+        ).lower():
+                raise RuntimeError(
+                "The JARVIS /tts response was not WAV audio."
+                )
 
-    	winsound.PlaySound(
-        	response.content,
-       		winsound.SND_MEMORY
-    	)
+        winsound.PlaySound(
+                response.content,
+                winsound.SND_MEMORY
+        )
 
 
     def transcribe(self, wav_data: bytes) -> str:
