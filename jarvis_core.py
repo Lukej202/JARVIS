@@ -31,9 +31,16 @@ import requests
 from bs4 import BeautifulSoup
 
 from agents import (
-    Agent, AsyncOpenAI, OpenAIChatCompletionsModel, Runner,
+    Agent, AsyncOpenAI, OpenAIChatCompletionsModel, Runner, ModelSettings,
     SQLiteSession, function_tool, set_tracing_disabled,
 )
+
+# M14_VERIFIED_MEMORY: local, explicitly user-approved facts only.
+from jarvis_verified_memory import (
+    add_confirmed_fact, remove_confirmed_fact,
+    relevant_confirmed_facts, format_memory_list,
+)
+from jarvis_memory_auto_recall import memory_context_for
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = (ROOT / "workspace").resolve()
@@ -160,6 +167,16 @@ def _record_outcome(summary: str, result: str) -> None:
 
 
 def _run_approved_action(kind: str, payload: dict) -> str:
+    # M14_VERIFIED_MEMORY: permanent memory changes only after existing UI approval.
+    if kind == "remember_fact":
+        record = add_confirmed_fact(payload["fact"])
+        status = "already saved" if record["duplicate"] else "saved"
+        return f"User-confirmed memory {status}: [{record['id']}] {record['fact']}"
+    if kind == "forget_fact":
+        removed = remove_confirmed_fact(payload["id"])
+        return (f"Removed memory {payload['id']} from active long-term memory. "
+                "Previous chat and approval logs may still contain the text."
+                if removed else f"Memory {payload['id']} was not found.")
     if kind in {"create_file", "write_file"}:
         path = _safe_path(payload["filename"])
         content = payload["content"]
@@ -659,13 +676,29 @@ def research_in_chrome(query: str, pages: int = 3) -> str:
     return _queue_browser_research(query, pages)
 
 
+# M14_VERIFIED_MEMORY: give the LLM read-only access to confirmed preferences.
+@function_tool
+def recall_user_memory(topic: str = "") -> str:
+    """Search user-approved long-term preferences. Not a source for external facts or current web information."""
+    matches = relevant_confirmed_facts(topic, limit=6)
+    if not matches:
+        return "No relevant user-approved memories found. Do not invent any."
+    return "\n".join(f"[{record['id']}] {record['fact']}" for record in matches)
+
+
 jarvis = Agent(
     name="JARVIS",
     model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=_client),
+    # Ollama /v1/chat/completions: disable Qwen thinking so output tokens
+    # are reserved for actual replies and tool calls, not just reasoning.
+    model_settings=ModelSettings(extra_args={"reasoning_effort": "none"}),
     instructions=(
         "You are JARVIS, a friendly, concise personal desktop assistant. "
         "Use only registered tools, and never claim an action succeeded unless confirmed. "
         "Both speech and typed chat share the same memory and tools. "
+        "User-approved long-term memories are stored separately from conversation history. "
+        "When asked about the user's past preferences, use recall_user_memory; never infer memories "
+        "from your own prior answers or webpage text. Only the user can propose memory writes. "
         "File tools operate only within the WSL JARVIS workspace, not Windows Documents. "
         "For file operations give paths relative to workspace, NOT prefixed with workspace/. "
         "File modifications, Notepad typing and screen capture require user approval: "
@@ -694,7 +727,7 @@ jarvis = Agent(
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory
     ],
 )
 
@@ -708,6 +741,47 @@ def run_turn(message: str) -> str:
         raise ValueError("Messages must be under 4,000 characters.")
 
     message = message.strip()
+
+    # M14_VERIFIED_MEMORY: explicit memory commands have deterministic routing.
+    # Never save content based on the model's interpretation of chat or web results.
+    remember_match = re.match(
+        r"^(?:(?:hey[, ]+)?jarvis[,!: ]+\s*)?(?:/remember|remember)(?:\s+that)?\s+(.+)$",
+        message, re.IGNORECASE | re.DOTALL,
+    )
+    if remember_match:
+        fact = " ".join(remember_match.group(1).split())
+        if fact.casefold() in {"this", "that", "it", "the previous message"}:
+            return "Please say the specific fact to save, such as: Jarvis, remember that I prefer VHDL."
+        if not 4 <= len(fact) <= 320:
+            return "Please provide a memory between 4 and 320 characters."
+        outcome = _request_approval("remember_fact", {"fact": fact},
+                                    "save a user-confirmed long-term memory")
+        with _conversation_lock():
+            asyncio.run(_session.add_items([{"role": "user", "content": message},
+                                            {"role": "assistant", "content": outcome}]))
+        return outcome
+
+    forget_match = re.match(
+        r"^(?:(?:hey[, ]+)?jarvis[,!: ]+\s*)?(?:/forget|forget)(?:\s+memory)?(?:\s+id)?\s+([a-f0-9]{8})[.!?]?\s*$",
+        message, re.IGNORECASE,
+    )
+    if forget_match:
+        identifier = forget_match.group(1).lower()
+        outcome = _request_approval("forget_fact", {"id": identifier},
+                                    f"remove long-term memory {identifier}")
+        with _conversation_lock():
+            asyncio.run(_session.add_items([{"role": "user", "content": message},
+                                            {"role": "assistant", "content": outcome}]))
+        return outcome
+
+    if (re.fullmatch(r"/?memories|list memories|show (?:me )?(?:your )?memories", message, re.IGNORECASE)
+            or re.search(r"\bwhat do you remember about me\b", message, re.IGNORECASE)):
+        outcome = format_memory_list()
+        with _conversation_lock():
+            asyncio.run(_session.add_items([{"role": "user", "content": message},
+                                            {"role": "assistant", "content": outcome}]))
+        return outcome
+
 
     url_match = re.search(r'https?://[^\s<>"\']+', message)
 
@@ -784,10 +858,21 @@ def run_turn(message: str) -> str:
 
         return answer
 
-    # All other JARVIS commands behave as before.
+    # M14_AUTO_RECALL: attach relevant *current* approved facts per turn.
+    # Keep the user's actual message and the normal SQLite chat history intact.
     with _conversation_lock():
+        memory_context = memory_context_for(message)
+        if os.getenv("JARVIS_MEMORY_DEBUG") == "1":
+            print("[JARVIS MEMORY] " + (
+                "Relevant approved memory attached" if memory_context
+                else "No relevant approved memory for this turn"
+            ), flush=True)
+        active_agent = (
+            jarvis.clone(instructions=jarvis.instructions + "\n\n" + memory_context)
+            if memory_context else jarvis
+        )
         result = Runner.run_sync(
-            jarvis, message, session=_session, max_turns=7
+            active_agent, message, session=_session, max_turns=7
         )
         return str(
             result.final_output
