@@ -108,6 +108,57 @@ function collectSearchResults() {
   return {title: document.title, results};
 }
 
+// Read ONLY a visible Google AI Overview on a JARVIS-created search tab.
+// Google frequently changes its DOM; absence is normal and must fall back to
+// ordinary search results rather than guessing or reading the whole page.
+function collectGoogleAiOverview() {
+  // Google AI Overviews are dynamic and can use different nested DOM structures.
+  // Only extract text beneath an explicitly visible AI Overview heading.
+  if (!/(^|\.)google\.[a-z.]+$/.test(location.hostname) || location.pathname !== '/search') {
+    return {available:false, reason:'not_google_search'};
+  }
+  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = el => {
+    if (!el || !el.getClientRects().length) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  // Find an actual heading, rather than assuming the container is named consistently.
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,[role="heading"],span,div')]
+    .filter(el => visible(el) && /^AI Overview(?:\s*\(experimental\))?$/i.test(normalize(el.innerText || el.textContent)))
+    .slice(0, 15);
+  for (const heading of headings) {
+    let node = heading.parentElement;
+    let best = null;
+    // Prefer smallest plausible ancestor: avoid copying normal search results.
+    for (let depth = 0; depth < 9 && node && node !== document.body; depth++, node = node.parentElement) {
+      if (!visible(node)) continue;
+      const raw = normalize(node.innerText);
+      if (raw.length < 95 || raw.length > 9000) continue;
+      if (!/^AI Overview\b/i.test(raw)) continue;
+      const summary = raw.replace(/^AI Overview(?:\s*\(experimental\))?\s*/i, '')
+        .replace(/\s*(?:AI responses may include mistakes|AI-generated responses may be inaccurate)\.?\s*$/i, '')
+        .trim();
+      if (summary.length < 95) continue;
+      if (!best || summary.length < best.summary.length) best = {node, summary};
+    }
+    if (!best) continue;
+    const sources = [];
+    const seen = new Set();
+    for (const a of best.node.querySelectorAll('a[href]')) {
+      try {
+        const u = new URL(a.href);
+        if (u.protocol !== 'https:' || /(^|\.)google\./i.test(u.hostname) || seen.has(u.href)) continue;
+        seen.add(u.href);
+        sources.push({title:normalize(a.innerText || a.getAttribute('aria-label') || u.hostname).slice(0,130), url:u.href});
+        if (sources.length >= 8) break;
+      } catch (_) { /* ignore invalid source URLs */ }
+    }
+    return {available:true, text:best.summary.slice(0,2800), sources};
+  }
+  return {available:false, reason:headings.length ? 'overview_container_not_readable' : 'overview_heading_not_detected'};
+}
+
 function extractResearchText() {
   if (document.querySelector('input[type="password"],form[action*="/login"],form[action*="/signin"]')) {
     return {blocked: true, reason: 'Login or password form detected; page was not read.'};
@@ -221,7 +272,7 @@ async function conductResearch(job) {
   try {
     const query = String(job.query || '').slice(0, 220);
     const pages = Math.min(Math.max(Number(job.pages) || 1, 1), 3);
-    const report = {query, pages:[], errors:[], stopped:false};
+    const report = {query, pages:[], errors:[], stopped:false, overview:null};
     const win = await chrome.windows.getLastFocused({windowTypes:['normal']}).catch(() => null);
     const windowId = win?.type === 'normal' ? win.id : undefined;
     if (await cancelled(job.id)) { report.stopped = true; return report; }
@@ -233,6 +284,30 @@ async function conductResearch(job) {
         await waitReady(search.id);
         const result = await injectOwned(search.id, collectSearchResults);
         hits = (result.results || []).filter(item => isPublicWebUrl(item.url));
+        if (engine === 'google') {
+          // Google's AI Overview may be absent even when search results exist.
+          // Use the same tab-ownership guard as every other DOM extraction.
+          let overview = {available:false, reason:'not_checked'};
+          // Google often renders the AI Overview after normal page load.
+          // Poll briefly instead of falling back immediately.
+          for (let attempt = 0; attempt < 6; attempt++) {
+            if (attempt) await new Promise(resolve => setTimeout(resolve, 1200));
+            if (await cancelled(job.id)) { report.stopped = true; return report; }
+            overview = await injectOwned(search.id, collectGoogleAiOverview);
+            if (overview.available && String(overview.text || '').length >= 95) break;
+          }
+          if (overview.available && String(overview.text || '').length >= 95) {
+            const sources = (overview.sources || []).filter(item => isPublicWebUrl(item.url));
+            report.overview = {text:overview.text.slice(0, 2800), sources:sources.slice(0, 8)};
+            // Prefer cited overview sources for verification, while preserving
+            // ordinary search results if citations aren't available.
+            const keys = new Set(sources.map(item => item.url));
+            hits = [...sources.map(item => ({...item, snippet:''})),
+                    ...hits.filter(item => !keys.has(item.url))];
+          } else {
+            console.info('[JARVIS research] AI Overview unavailable:', overview.reason || 'no visible summary');
+          }
+        }
         if (hits.length) break;
         report.errors.push(engine + ': no normal search results extracted (possibly a consent page).');
       } catch (error) { report.errors.push(engine + ': ' + String(error.message).slice(0, 170)); }

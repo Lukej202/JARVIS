@@ -19,6 +19,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import re
+from jarvis_output import clean_model_output
 
 from agents import (
     AsyncOpenAI,
@@ -278,7 +279,7 @@ def _run_approved_action(kind: str, payload: dict) -> str:
             f"{text[:11000]}"
         )
         result = Runner.run_sync(reader, prompt, max_turns=2)
-        answer = str(result.final_output or "No summary was generated.")
+        answer = clean_model_output(result.final_output or "No summary was generated.")
         return f"Chrome tab read: {page['title']}\nSource: {page['url']}\n\n{answer}"
 
     # M13_BROWSER_CONTROL: approved, read-only multi-page browser research.
@@ -287,7 +288,8 @@ def _run_approved_action(kind: str, payload: dict) -> str:
         from jarvis_extension_bridge import enqueue_research
         report = enqueue_research(payload["query"], max_pages=int(payload["pages"]))
         sources = report.get("pages", [])
-        if not sources:
+        overview = report.get("overview")
+        if not sources and not (isinstance(overview, dict) and overview.get("text")):
             return ("Browser research " + ("was stopped. " if report.get("stopped") else "found no readable pages. ")
                     + " ".join(report.get("errors", []))[:800])
         from datetime import datetime
@@ -295,13 +297,28 @@ def _run_approved_action(kind: str, payload: dict) -> str:
         actual_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
         evidence = _json.dumps({"query": report["query"], "pages": sources}, ensure_ascii=False)
         from jarvis_research_summarizer import summarize_research
-        answer = summarize_research(report, model=MODEL_NAME, ollama_api=OLLAMA_API)
+        if isinstance(overview, dict) and str(overview.get("text", "")).strip():
+            # Fast path: show Google's VISIBLE AI Overview, attributed as an
+            # AI-generated summary, not falsely described as verified facts.
+            # Avoid a second Ollama summarization round trip.
+            overview_text = " ".join(str(overview["text"]).split())[:1800]
+            answer = ("Google AI Overview (AI-generated; claims not independently verified):\n"
+                      + overview_text)
+            if not sources:
+                answer += "\n\nNo source pages could be independently opened."
+            else:
+                answer += "\n\nRelated source pages were opened; review the links below to verify claims."
+        else:
+            answer = clean_model_output(summarize_research(report, model=MODEL_NAME, ollama_api=OLLAMA_API))
         prefix = "Research stopped early; partial findings below.\n" if report.get("stopped") else ""
         errors = "\nPages that could not be read: " + "; ".join(report["errors"][:3]) if report.get("errors") else ""
-        source_list = "\n\nSources actually opened:\n" + "\n".join(
+        source_list = ("\n\nSources actually opened:\n" + "\n".join(
             f"[{i}] {p['title']} — {p['url']}" for i, p in enumerate(sources, 1)
-        )
-        return prefix + answer + source_list + errors
+        )) if sources else ""
+        cited = overview.get("sources", []) if isinstance(overview, dict) else []
+        cited_list = ("\n\nLinks cited by Google's AI Overview (not independently verified):\n" +
+                      "\n".join(f"- {item['title']} — {item['url']}" for item in cited[:5])) if cited else ""
+        return prefix + answer + source_list + cited_list + errors
 
     raise ValueError("Unknown action: " + kind)
 
@@ -588,32 +605,54 @@ def get_system_info() -> str:
     return f"OS: {platform.system()}, release: {platform.release()}"
 
 
+def _log_automatic_action(kind: str, summary: str, result: str) -> None:
+    """Record verified low-risk operations without making another approval request."""
+    with _actions_connection() as db:
+        db.execute(
+            "INSERT INTO actions VALUES (?, ?, ?, ?, 'completed', ?, ?)",
+            (secrets.token_hex(6), kind, "{}", summary, time.time(), result),
+        )
+
+
 @function_tool
 def create_folder(name: str) -> str:
-    """Request user approval to create a folder inside the WSL JARVIS workspace."""
+    """Immediately create a NEW folder inside the approved WSL workspace. Never overwrite."""
     try:
         path = _safe_path(name)
-        if path.exists():
-            return "Folder already exists."
-        return _request_approval("create_folder", {"name": name},
-                                 f"create folder '{name}'")
-    except ValueError as err:
-        return f"Rejected: {err}"
+        # Exclusive creation: existing paths are never changed.
+        path.mkdir(parents=False, exist_ok=False)
+        if not path.is_dir():
+            return "Folder creation could not be verified."
+        result = f"Created and verified workspace folder: {path.relative_to(WORKSPACE)}"
+        _log_automatic_action("create_folder", f"create folder '{name}'", result)
+        return result
+    except FileExistsError:
+        return "Folder or file already exists; nothing changed."
+    except (ValueError, OSError) as err:
+        return f"Could not create folder: {type(err).__name__}: {err}"
 
 
 @function_tool
 def create_file(filename: str, content: str) -> str:
-    """Request approval to create a new UTF-8 text file in the WSL workspace."""
+    """Immediately create a NEW UTF-8 workspace file, never replace an existing file."""
     try:
         path = _safe_path(filename)
-        if path.exists():
-            return "File already exists; use write_file to request overwrite approval."
         if len(content) > 30000:
-            return "Content exceeds 30,000 characters."
-        return _request_approval("create_file", {"filename": filename, "content": content},
-                                 f"create file '{filename}'")
-    except ValueError as err:
-        return f"Rejected: {err}"
+            return "Content exceeds 30,000 characters; nothing changed."
+        if not path.parent.is_dir():
+            return "Parent directory does not exist; create the folder first."
+        # Mode 'x' rejects an existing file, including if another process creates it.
+        with path.open("x", encoding="utf-8") as fp:
+            fp.write(content)
+        if path.read_text(encoding="utf-8") != content:
+            return "File was written but verification failed; inspect it manually."
+        result = f"Created and verified workspace file: {path.relative_to(WORKSPACE)}"
+        _log_automatic_action("create_file", f"create file '{filename}'", result)
+        return result
+    except FileExistsError:
+        return "File already exists; nothing changed. Use write_file for an approved overwrite."
+    except (ValueError, OSError, UnicodeError) as err:
+        return f"Could not create file: {type(err).__name__}: {err}"
 
 
 @function_tool
@@ -667,19 +706,24 @@ def read_chrome_tab(url: str, question: str = "Summarize this webpage.") -> str:
     return request_chrome_tab_read(url, question)
 
 
-# M13_BROWSER_CONTROL: isolated Chrome public research (single task approval).
+# M13_BROWSER_CONTROL: isolated, public Chrome research; no approval needed.
 def _queue_browser_research(query: str, pages: int = 3) -> str:
+    """Run public, read-only research immediately; retain tab/page restrictions."""
     if not isinstance(query, str) or not (2 <= len(query.strip()) <= 220):
         return "Please provide a research topic between 2 and 220 characters."
     if not isinstance(pages, int) or isinstance(pages, bool) or not 1 <= pages <= 3:
-        return "Research is limited to 1–3 public pages per approved task."
-    return _request_approval("browser_research", {"query": query.strip(), "pages": pages},
-                             f"research '{query.strip()[:110]}' in JARVIS-created tabs in your current Chrome window")
+        return "Research is limited to 1–3 public pages per task."
+    try:
+        result = _run_approved_action("browser_research", {"query": query.strip(), "pages": pages})
+        # Never claim a successful research action unless the bridge returned results.
+        return result
+    except Exception as exc:
+        return f"Browser research failed: {type(exc).__name__}: {exc}"
 
 
 @function_tool
 def research_in_chrome(query: str, pages: int = 3) -> str:
-    """Request one approval to research up to 3 public websites in the user's regular Chrome window, through ONLY JARVIS extension-created research tabs. No forms, purchases, downloads, or personal-tab reading."""
+    """Research 1–3 public pages in extension-created Chrome tabs. No personal tabs, forms, or downloads."""
     return _queue_browser_research(query, pages)
 
 
@@ -722,9 +766,13 @@ jarvis = Agent(
         "from your own prior answers or webpage text. Only the user can propose memory writes. "
         "File tools operate only within the WSL JARVIS workspace, not Windows Documents. "
         "For file operations give paths relative to workspace, NOT prefixed with workspace/. "
-        "File modifications, Notepad typing and screen capture require user approval: "
-        "these tools only QUEUE actions. Tell the user to approve in the browser panel "
-        "or with /approve ID in the terminal. Never claim an unapproved action ran. "
+        "When asked to create a NEW workspace file or folder, call create_file or create_folder; "
+        "these tools execute immediately and return verification. No approval is needed for them. "
+        "Existing file overwrites through write_file, Notepad typing, screen capture, "
+        "and other protected operations still QUEUE approval requests. "
+        "Tell the user the approval ID when queued; never claim an unapproved action ran. "
+        "Never claim a file exists unless a tool confirms it was created or read. "
+        "If a tool reports a failure, explain the failure instead of claiming success. "
         "Do not repeat an action after it is queued; wait for approval. "
         "Screen vision uses a separate local Ollama vision model after approval. "
         "No deletion, arbitrary shell execution, email sending, or unrestricted mouse control. "
@@ -741,7 +789,7 @@ jarvis = Agent(
         "search results or webpage contents. "
         "Never attempt to read existing personal Chrome tabs. "
         "Research must use new tabs created by the paired extension and only after approval. "
-        "For multi-page public internet research, use research_in_chrome, which queues one approval. "
+        "For multi-page public internet research, use research_in_chrome; public research runs automatically. "
         "It opens only JARVIS-created research tabs in the user's regular Chrome window through the paired extension. "
         "Never claim research completed before approval. Do not log in, buy, submit forms or download."
     ),
@@ -867,7 +915,7 @@ def run_turn(message: str) -> str:
             result = Runner.run_sync(
                 web_reader, prompt, max_turns=2
             )
-            answer = str(
+            answer = clean_model_output(
                 result.final_output or "No summary was generated."
             )
 
@@ -895,7 +943,7 @@ def run_turn(message: str) -> str:
         result = Runner.run_sync(
             active_agent, message, session=_session, max_turns=7
         )
-        return str(
+        return clean_model_output(
             result.final_output
             or "I couldn't complete that request."
         )

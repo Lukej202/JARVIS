@@ -1,46 +1,47 @@
-"""Authenticated, local-only queue connecting approved JARVIS research to Chrome extension.
+"""Local authenticated Chrome extension research bridge, shared across WSL processes.
 
-The extension is the only component with Chrome access.  Each approved task has
-one randomly generated ID.  No personal tabs or browser credentials are sent to
-this process, and the bridge never calls arbitrary extension code.
+SQLite holds only research jobs and extension heartbeat. The pairing secret stays
+in .jarvis_extension_key and is never included in job results or model prompts.
+Compatible with the Flask /extension endpoints and jarvis_core enqueue_research.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, RLock
-from collections import deque
 import hmac
+import json
 import os
 import secrets
+import sqlite3
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 KEY_FILE = ROOT / '.jarvis_extension_key'
+DB_FILE = ROOT / '.jarvis_extension_jobs.db'
 MAX_RESULT_BYTES = 45_000
 MAX_PAGES = 3
-_lock = RLock()
-_queue: deque[str] = deque()
-_jobs: dict[str, 'Job'] = {}
-_last_heartbeat = 0.0
 
 
-@dataclass
-class Job:
-    id: str
-    query: str
-    pages: int
-    state: str = 'pending'
-    claimed_at: float = 0.0
-    cancelled: bool = False
-    report: dict[str, Any] | None = None
-    error: str = ''
-    complete: Event = field(default_factory=Event)
+def _connect() -> sqlite3.Connection:
+    db = sqlite3.connect(str(DB_FILE), timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute('PRAGMA busy_timeout=15000')
+    db.execute('''CREATE TABLE IF NOT EXISTS bridge_status
+                  (name TEXT PRIMARY KEY, last_seen REAL NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS research_jobs
+                  (id TEXT PRIMARY KEY, query TEXT NOT NULL, pages INTEGER NOT NULL,
+                   state TEXT NOT NULL, claimed_at REAL NOT NULL DEFAULT 0,
+                   cancelled INTEGER NOT NULL DEFAULT 0, report TEXT, error TEXT NOT NULL DEFAULT '',
+                   created_at REAL NOT NULL)''')
+    db.commit()
+    if os.name == 'posix':
+        os.chmod(DB_FILE, 0o600)
+    return db
 
 
 def pairing_key() -> str:
-    """Persistent random local secret. Never include this in repo or model prompts."""
+    """Persistent random local secret. Never include in repo or model prompts."""
     if KEY_FILE.is_file():
         return KEY_FILE.read_text(encoding='ascii').strip()
     new_key = secrets.token_urlsafe(32)
@@ -58,116 +59,147 @@ def verify_key(value: str) -> bool:
 
 
 def heartbeat() -> None:
-    global _last_heartbeat
-    with _lock:
-        _last_heartbeat = time.monotonic()
+    with _connect() as db:
+        db.execute('''INSERT INTO bridge_status(name,last_seen) VALUES('extension',?)
+                      ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen''',
+                   (time.time(),))
+        db.commit()
 
 
 def connected() -> bool:
-    with _lock:
-        return time.monotonic() - _last_heartbeat < 65
+    with _connect() as db:
+        row = db.execute("SELECT last_seen FROM bridge_status WHERE name='extension'").fetchone()
+    return row is not None and 0 <= time.time() - float(row['last_seen']) < 65
 
 
-def enqueue_research(query: str, *, max_pages: int = 3, timeout: float = 180) -> dict[str, Any]:
+def enqueue_research(query: str, *, max_pages: int = 3,
+                     timeout: float = 180) -> dict[str, Any]:
     if not isinstance(query, str) or not 2 <= len(query.strip()) <= 220:
         raise ValueError('Research topic must have 2–220 characters.')
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or not 1 <= max_pages <= MAX_PAGES:
         raise ValueError('Requested page limit is invalid.')
     if not connected():
         raise RuntimeError('JARVIS Chrome extension is not connected. Open its popup and connect it to the local Flask server.')
-    job = Job(id=secrets.token_hex(12), query=query.strip(), pages=max_pages)
-    with _lock:
-        _jobs[job.id] = job
-        _queue.append(job.id)
-    finished = job.complete.wait(timeout=timeout)
-    with _lock:
-        _jobs.pop(job.id, None)
-        try:
-            _queue.remove(job.id)
-        except ValueError:
-            pass
-        error, report = job.error, job.report
-    if not finished:
+    jid = secrets.token_hex(12)
+    with _connect() as db:
+        db.execute('''INSERT INTO research_jobs(id,query,pages,state,created_at)
+                      VALUES(?,?,?,'pending',?)''',
+                   (jid, query.strip(), max_pages, time.time()))
+        db.commit()
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            with _connect() as db:
+                row = db.execute('SELECT state,report,error FROM research_jobs WHERE id=?', (jid,)).fetchone()
+            if row is None:
+                raise RuntimeError('Research job disappeared from the shared queue.')
+            if row['state'] == 'completed':
+                if row['error']:
+                    raise RuntimeError(str(row['error'])[:500])
+                report = json.loads(row['report']) if row['report'] else None
+                if not isinstance(report, dict):
+                    raise RuntimeError('The extension did not return a research report.')
+                return report
+            time.sleep(0.35)
         raise TimeoutError('Chrome extension did not finish within 3 minutes. Check its popup and service-worker errors.')
-    if error:
-        raise RuntimeError(error[:500])
-    if not isinstance(report, dict):
-        raise RuntimeError('The extension did not return a research report.')
-    return report
+    finally:
+        with _connect() as db:
+            db.execute('DELETE FROM research_jobs WHERE id=?', (jid,))
+            db.commit()
 
 
 def claim_next() -> dict[str, Any] | None:
     heartbeat()
-    with _lock:
-        for jid in list(_queue):
-            job = _jobs.get(jid)
-            if not job or job.complete.is_set():
-                try:
-                    _queue.remove(jid)
-                except ValueError:
-                    pass
-                continue
-            if job.cancelled:
-                job.report = {'query': job.query, 'pages': [], 'errors': [], 'stopped': True}
-                job.complete.set()
-                continue
-            if job.state == 'pending' or (job.state == 'running' and time.monotonic() - job.claimed_at > 75):
-                job.state = 'running'
-                job.claimed_at = time.monotonic()
-                return {'id': job.id, 'query': job.query, 'pages': job.pages}
-    return None
+    with _connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        # Pick one pending job, or an abandoned running job after 75 s.
+        row = db.execute('''SELECT id,query,pages FROM research_jobs
+                            WHERE cancelled=0 AND
+                                (state='pending' OR (state='running' AND claimed_at<?))
+                            ORDER BY created_at ASC LIMIT 1''', (time.time()-75,)).fetchone()
+        if row is None:
+            db.commit()
+            return None
+        db.execute("UPDATE research_jobs SET state='running',claimed_at=? WHERE id=?",
+                   (time.time(), row['id']))
+        db.commit()
+        return {'id': row['id'], 'query': row['query'], 'pages': row['pages']}
 
 
 def is_cancelled(job_id: str) -> bool:
     heartbeat()
-    with _lock:
-        job = _jobs.get(job_id)
-        return job is None or job.cancelled or job.complete.is_set()
+    with _connect() as db:
+        row = db.execute('SELECT cancelled,state FROM research_jobs WHERE id=?', (job_id,)).fetchone()
+    return row is None or bool(row['cancelled']) or row['state'] == 'completed'
 
 
 def request_stop() -> str:
-    with _lock:
-        active = [job for job in _jobs.values() if not job.complete.is_set()]
-        for job in active:
-            job.cancelled = True
-        return ('Stop requested for the current research task.' if active else 'No research task is currently running.')
+    with _connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        rows = db.execute("SELECT id,query FROM research_jobs WHERE state!='completed'").fetchall()
+        for row in rows:
+            report = {'query': row['query'], 'pages': [], 'errors': [], 'stopped': True}
+            db.execute('''UPDATE research_jobs SET cancelled=1,state='completed',report=?
+                          WHERE id=?''', (json.dumps(report), row['id']))
+        db.commit()
+    return ('Stop requested for the current research task.' if rows
+            else 'No research task is currently running.')
 
 
 def receive_result(payload: dict[str, Any]) -> bool:
     if not isinstance(payload, dict) or len(str(payload)) > MAX_RESULT_BYTES * 2:
         raise ValueError('Invalid or oversized extension result.')
     jid = payload.get('id')
-    with _lock:
-        job = _jobs.get(jid) if isinstance(jid, str) else None
-        if job is None or job.complete.is_set():
+    if not isinstance(jid, str):
+        return False
+    with _connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        job = db.execute('SELECT query,pages,state FROM research_jobs WHERE id=?', (jid,)).fetchone()
+        if job is None or job['state'] == 'completed':
+            db.commit()
             return False
         if payload.get('error'):
-            job.error = str(payload['error'])[:500]
+            error = str(payload['error'])[:500]
+            report = None
         else:
             data = payload.get('report')
             if not isinstance(data, dict) or not isinstance(data.get('pages'), list):
                 raise ValueError('Malformed extension report.')
             pages = []
-            for page in data['pages'][:job.pages]:
+            for page in data['pages'][:job['pages']]:
                 if not isinstance(page, dict):
                     continue
-                from urllib.parse import urlsplit
                 url = str(page.get('url', ''))[:2048]
                 parsed = urlsplit(url)
                 if parsed.scheme != 'https' or not parsed.hostname:
                     continue
-                pages.append({
-                    'title': str(page.get('title', ''))[:240],
-                    'url': url,
-                    'preview': str(page.get('preview', ''))[:6500],
-                })
-            job.report = {
-                'query': job.query,
-                'pages': pages,
-                'errors': [str(x)[:220] for x in data.get('errors', [])[:6]],
-                'stopped': bool(data.get('stopped')) or job.cancelled,
-            }
-        job.complete.set()
+                pages.append({'title': str(page.get('title', ''))[:240],
+                              'url': url, 'preview': str(page.get('preview', ''))[:6500]})
+            # AI Overview is optional, untrusted Google-generated text.
+            # Preserve a bounded excerpt and public HTTPS citations only.
+            raw_overview = data.get('overview')
+            overview = None
+            if isinstance(raw_overview, dict):
+                summary = str(raw_overview.get('text', '')).strip()[:2800]
+                cited_sources = []
+                for link in raw_overview.get('sources', [])[:8] if isinstance(raw_overview.get('sources'), list) else []:
+                    if not isinstance(link, dict):
+                        continue
+                    address = str(link.get('url', ''))[:2048]
+                    parsed_link = urlsplit(address)
+                    if (parsed_link.scheme != 'https' or not parsed_link.hostname or
+                            parsed_link.hostname.lower().endswith('.google.com')):
+                        continue
+                    cited_sources.append({'title': str(link.get('title', ''))[:130], 'url': address})
+                if len(summary) >= 110:
+                    overview = {'text': summary, 'sources': cited_sources}
+            report = {'query': job['query'], 'pages': pages, 'overview': overview,
+                      'errors': [str(x)[:220] for x in data.get('errors', [])[:6]],
+                      'stopped': bool(data.get('stopped'))}
+            error = ''
+        db.execute("UPDATE research_jobs SET state='completed',report=?,error=? WHERE id=?",
+                   (json.dumps(report) if report is not None else None, error, jid))
+        db.commit()
         return True
 
 

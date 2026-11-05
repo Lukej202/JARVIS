@@ -33,3 +33,4 @@ tts_samples/
 
 # Local, user-approved long-term memory database
 jarvis_verified_memory.db*
+.jarvis_extension_jobs.db
