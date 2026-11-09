@@ -174,6 +174,55 @@ def _record_outcome(summary: str, result: str) -> None:
     }]))
 
 
+def _run_browser_research_v2(question: str) -> str:
+    """Use the bounded planner, Chrome bridge, and evidence-based report writer.
+
+    Kept separate from the legacy single-query implementation so rollback is
+    possible with JARVIS_RESEARCH_V2=0. This does not grant any new permissions.
+    """
+    from jarvis_research import conduct_research
+    from jarvis_research_summarizer_v2 import (
+        extract_evidence, evaluate_evidence, generate_final_report,
+    )
+
+    report = conduct_research(question)
+    sources = report.get("pages", [])[:3]
+    errors = list(report.get("errors", []))
+    stopped = bool(report.get("stopped"))
+    findings = []
+
+    # When the user stops browsing, do not continue with new model work.
+    if stopped:
+        return "Research stopped. No final report was generated."
+    if not sources:
+        details = "; ".join(str(e)[:220] for e in errors[:3])
+        return "Research found no readable source pages." + (" " + details if details else "")
+
+    for source_id, page in enumerate(sources, 1):
+        try:
+            extracted = extract_evidence(question, page, source_id)
+            findings.extend(evaluate_evidence(question, extracted))
+        except Exception as exc:
+            # A bad webpage or model output must not erase other usable evidence.
+            errors.append(f"Source [{source_id}] could not be evaluated: {type(exc).__name__}")
+
+    supported_count = sum(item.get("verdict") == "supported" for item in findings)
+    answer = generate_final_report(question, findings)
+    source_list = "\n\nSources actually opened:\n" + "\n".join(
+        f"[{i}] {str(p.get('title', 'Untitled'))[:200]} — {p.get('url', '')}"
+        for i, p in enumerate(sources, 1)
+    )
+    status = (
+        f"\n\nEvidence screening: {supported_count}/{len(findings)} findings "
+        "classified supported by the local model (not independently verified)."
+    )
+    error_note = (
+        "\nResearch limitations: " + "; ".join(str(e)[:220] for e in errors[:3])
+        if errors else ""
+    )
+    return answer + status + source_list + error_note
+
+
 def _run_approved_action(kind: str, payload: dict) -> str:
     # M14_VERIFIED_MEMORY: permanent memory changes only after existing UI approval.
     if kind == "remember_fact":
@@ -284,7 +333,11 @@ def _run_approved_action(kind: str, payload: dict) -> str:
 
     # M13_BROWSER_CONTROL: approved, read-only multi-page browser research.
     if kind == "browser_research":
-        import json as _json
+        # Default to the tested v2 pipeline for the standard three-page request.
+        # For smaller page budgets retain legacy behavior until the coordinator
+        # supports a configurable session-wide page limit.
+        if os.getenv("JARVIS_RESEARCH_V2", "1") != "0" and int(payload["pages"]) == 3:
+            return _run_browser_research_v2(payload["query"])
         from jarvis_extension_bridge import enqueue_research
         report = enqueue_research(payload["query"], max_pages=int(payload["pages"]))
         sources = report.get("pages", [])
@@ -292,10 +345,6 @@ def _run_approved_action(kind: str, payload: dict) -> str:
         if not sources and not (isinstance(overview, dict) and overview.get("text")):
             return ("Browser research " + ("was stopped. " if report.get("stopped") else "found no readable pages. ")
                     + " ".join(report.get("errors", []))[:800])
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        actual_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-        evidence = _json.dumps({"query": report["query"], "pages": sources}, ensure_ascii=False)
         from jarvis_research_summarizer import summarize_research
         if isinstance(overview, dict) and str(overview.get("text", "")).strip():
             # Fast path: show Google's VISIBLE AI Overview, attributed as an
@@ -788,10 +837,10 @@ jarvis = Agent(
         "The search_web tool opens Google Chrome; it does not return "
         "search results or webpage contents. "
         "Never attempt to read existing personal Chrome tabs. "
-        "Research must use new tabs created by the paired extension and only after approval. "
+        "Research must use new tabs created by the paired extension. "
         "For multi-page public internet research, use research_in_chrome; public research runs automatically. "
         "It opens only JARVIS-created research tabs in the user's regular Chrome window through the paired extension. "
-        "Never claim research completed before approval. Do not log in, buy, submit forms or download."
+        "Never claim research completed before the tool returns results. Do not log in, buy, submit forms or download."
     ),
     tools=[
         open_notepad, open_calculator, open_vscode,
