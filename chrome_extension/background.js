@@ -364,19 +364,29 @@ pollBridge();
 
 async function dispatch(message) {
   switch (message.type) {
-    case 'SET_BRIDGE_KEY': {
-      const key = String(message.key || '').trim();
-      if (key.length < 30 || key.length > 200) throw new Error('Invalid pairing key.');
-      await chrome.storage.local.set({[PAIRING_KEY]:key});
-      try {
-        await bridgeFetch('/extension/health');
-      } catch (error) {
-        await chrome.storage.local.remove(PAIRING_KEY);
-        throw new Error('Could not pair: check key and ensure Flask is running on port 5000.');
-      }
-      pollBridge();
-      return {connected:true};
-    }
+
+case 'SET_BRIDGE_KEY': {
+  const key = String(message.key || '').trim();
+
+  if (key.length < 30 || key.length > 200) {
+    throw new Error('Invalid pairing key.');
+  }
+
+  await chrome.storage.local.set({[PAIRING_KEY]: key});
+
+  try {
+    await bridgeFetch('/extension/health');
+    pollBridge();
+    return {connected: true};
+  } catch (error) {
+    // Keep the key when Flask is temporarily offline.
+    return {
+      connected: false,
+      note: 'Key saved. Waiting for JARVIS to reconnect.'
+    };
+  }
+}
+
     case 'BRIDGE_STATUS': {
       const config = await chrome.storage.local.get(PAIRING_KEY);
       if (!config[PAIRING_KEY]) return {connected:false, note:'Not paired'};
