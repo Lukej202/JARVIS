@@ -178,7 +178,7 @@ def _record_outcome(summary: str, result: str) -> None:
 def _run_approved_action(kind: str, payload: dict) -> str:
     # JARVIS_WORKSPACE_RUNNER_V1: only the approval dispatcher executes programs.
     if kind == "run_workspace_program":
-        from jarvis_workspace_runner import execute_approved_program
+        from tools.jarvis_workspace_runner import execute_approved_program
         return execute_approved_program(
             WORKSPACE, payload["filename"], payload.get("testbench", ""),
             payload.get("top_module", ""),
@@ -717,7 +717,7 @@ def run_workspace_program(filename: str, testbench: str = "", top_module: str = 
     filename="design.v". To simulate, also pass testbench="design_tb.v"
     and top_module="design_tb". Code is never executed until approved.
     """
-    from jarvis_workspace_runner import validate_request
+    from tools.jarvis_workspace_runner import validate_request
     try:
         payload = validate_request(WORKSPACE, filename, testbench, top_module)
     except (ValueError, OSError) as exc:
