@@ -7,6 +7,7 @@ OpenAI's hosted API. Mutating/visual desktop tools queue explicit approvals.
 import asyncio
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -203,8 +204,22 @@ def _run_approved_action(kind: str, payload: dict) -> str:
             with path.open("x", encoding="utf-8") as fp:
                 fp.write(content)
         else:
-            with path.open("w", encoding="utf-8") as fp:
-                fp.write(content)
+            if payload.get('_task_repair'):
+                expected = payload.get('_expected_sha256', '')
+                actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ''
+                if not expected or actual != expected:
+                    raise ValueError('Repair refused: source changed since proposal; no file overwritten.')
+                # Same-directory temporary file + atomic replacement after approval.
+                tmp = path.with_name(path.name + '.' + secrets.token_hex(6) + '.repair_tmp')
+                try:
+                    with tmp.open('x', encoding='utf-8') as fp:
+                        fp.write(content)
+                    tmp.replace(path)
+                finally:
+                    if tmp.exists(): tmp.unlink()
+            else:
+                with path.open("w", encoding="utf-8") as fp:
+                    fp.write(content)
         return f"Saved {path.relative_to(WORKSPACE)} in the WSL workspace."
 
     if kind == "create_folder":
@@ -338,7 +353,8 @@ def _task_manager():
         return match.group(1)
 
     return TaskManager(WORKSPACE, approval_lookup=find_approval,
-                       queue_approval=queue, log_action=_log_automatic_action)
+                       queue_approval=queue, log_action=_log_automatic_action,
+                       model=MODEL_NAME, ollama_url=OLLAMA_API)
 
 
 def _task_command(message: str) -> str:
@@ -346,7 +362,9 @@ def _task_command(message: str) -> str:
     manager = _task_manager()
     if not command or command.lower() == 'help':
         return ('Use /task followed by a Python or Verilog project objective. '
-                'Commands: /task status, /task resume, /task cancel.')
+                'Commands: /task status, /task resume, /task cancel, /task test-repair.')
+    if command.lower() == 'test-repair':
+        return manager.start_repair_test()
     if command.lower() == 'status':
         return manager.status()
     if command.lower() == 'resume':

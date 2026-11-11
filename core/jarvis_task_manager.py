@@ -101,13 +101,15 @@ def validated_plan(root: Path, plan: dict):
 
 
 class TaskManager:
-    def __init__(self, root, *, store_path=None, approval_lookup, queue_approval, log_action=None):
+    def __init__(self, root, *, store_path=None, approval_lookup, queue_approval, log_action=None, model=None, ollama_url=None):
         self.root=Path(root).resolve()
         self.store=TaskStore(store_path or self.root.parent/'jarvis_tasks.db')
         self.lock_path=self.root/'.jarvis_tasks.lock'
         self.approval_lookup=approval_lookup  # (task_id, step_index) => id,status,result or None
         self.queue_approval=queue_approval  # (kind,payload,description) => ID
         self.log_action=log_action
+        self.model=model
+        self.ollama_url=ollama_url
 
     @contextmanager
     def lock(self):
@@ -134,6 +136,43 @@ class TaskManager:
                 return self._advance(task_id)
             except (PlanningError,TaskError,ValueError) as exc:
                 return f'Task planning stopped: {exc} No new files were created.'
+
+    def start_repair_test(self):
+        """Create a disposable project with one known testbench syntax error.
+
+        No existing files are modified. Compilation, repair overwrite, and
+        second compilation still go through the normal approval pipeline.
+        """
+        from core.jarvis_task_planner import _counter_plan
+        if self.store.active():
+            return 'Another autonomous task is active. Use /task status or /task cancel.'
+        objective = 'Create a 4-bit Verilog up-counter and verify its self-checking testbench.'
+        plan = _counter_plan(objective)
+        if plan is None:
+            return 'Repair test unavailable: trusted counter fixture is missing.'
+        plan['project'] = 'repair_demo_' + secrets.token_hex(4)
+        tb_name = plan['run']['testbench']
+        matches = [item for item in plan['files'] if item['path'] == tb_name]
+        if len(matches) != 1:
+            return 'Repair test unavailable: unexpected testbench fixture.'
+        original = matches[0]['content']
+        if original.count('        $finish;') != 1:
+            return 'Repair test unavailable: cannot identify the expected syntax-error location.'
+        matches[0]['content'] = original.replace('        $finish;', '        $finish', 1)
+        plan['_repair_test'] = True
+        with self.lock():
+            if self.store.active():
+                return 'Another autonomous task is active. Use /task status or /task cancel.'
+            try:
+                steps = validated_plan(self.root, plan)
+                task_id = secrets.token_hex(6)
+                self.store.create(task_id, objective, plan, steps)
+                outcome = self._advance(task_id)
+                return ('Repair test created a NEW disposable project with a deliberately '
+                        'broken testbench.\n' + outcome +
+                        '\nApprove the initial simulation to trigger compiler diagnostics.')
+            except (PlanningError, TaskError, ValueError) as exc:
+                return f'Repair test stopped: {exc} No existing projects were modified.'
 
     def status(self):
         with self.lock():
@@ -189,6 +228,9 @@ class TaskManager:
                     if self.log_action: self.log_action('create_file',f"Task {task_id}: {step['path']}",f"Verified {step['path']}")
                 elif step['kind']=='run':
                     existing=self.approval_lookup(task_id,idx)
+                    # After an approved repair, old completed run actions must not be replayed.
+                    if task['plan'].get('_repair_stage') == 'rerun':
+                        existing = None
                     if existing:
                         action_id,status,result=existing
                         if status=='completed':
@@ -210,6 +252,9 @@ class TaskManager:
                     payload['_review']='\n\n'.join(review)[:16000]
                     action_id=self.queue_approval('run_workspace_program',payload,
                               f"Task {task_id}: simulate or run {step['filename']}")
+                    if task['plan'].get('_repair_stage') == 'rerun':
+                        plan = task['plan']; plan['_repair_stage'] = 'running'
+                        self.store.update(task_id, plan=plan)
                     self.store.update(task_id,status='waiting_approval',approval_id=action_id,
                                       note='Source files created and verified. Execution requires approval.')
                     return f"Task `{task_id}` created its files. Action waiting for approval `{action_id}`."
@@ -226,7 +271,9 @@ class TaskManager:
         if not task:
             return 'Task not found; review action history.'
         match = re.search(r'(?:Simulation exit code|Exit code):\s*(-?\d+)', result)
-        if result.startswith('Verilog compile FAILED') or match is None or int(match.group(1)) != 0:
+        if result.startswith('Verilog compile FAILED'):
+            return self._propose_repair(task_id, idx, task, result)
+        if match is None or int(match.group(1)) != 0:
             self.store.update(task_id,status='failed',approval_id='',note='Execution failed; full diagnostics in the action history.')
             return f'Task `{task_id}` failed during execution. Review the action history.'
         if re.search(r'(?im)^\s*(?:FAIL(?:ED)?\b|ERROR\s*:)', result):
@@ -245,6 +292,43 @@ class TaskManager:
         if waveform:
             message += ' Waveform: ' + waveform.group(1)[:180]
         return message
+    def _propose_repair(self, task_id, idx, task, diagnostics):
+        """Compile failures only: propose a single-file repair for explicit approval."""
+        plan = task['plan']
+        attempts = int(plan.get('_repair_attempts', 0))
+        if attempts >= 2 or not self.model or not self.ollama_url:
+            self.store.update(task_id, status='failed', approval_id='',
+                              note='Compilation still failed; automatic repair limit reached or model unavailable.')
+            return f'Task `{task_id}` failed compilation. Repair limit reached; diagnostics saved in action history.'
+        try:
+            from core.jarvis_task_repair import propose_verilog_repair
+            run = next(step for step in task['steps'] if step['kind'] == 'run')
+            sources = {}
+            for rel in (run['filename'], run['testbench']):
+                path = self._safe_target(rel)
+                sources[rel] = path.read_text(encoding='utf-8')
+            filename, corrected = propose_verilog_repair(
+                task['objective'], diagnostics, sources, self.model, self.ollama_url)
+            if filename not in sources or corrected == sources[filename]:
+                raise TaskError('Repair was unchanged or referenced an unknown file.')
+            expected = hashlib.sha256(sources[filename].encode('utf-8')).hexdigest()
+            payload = {'filename': filename, 'content': corrected,
+                       '_expected_sha256': expected, '_task_repair': True,
+                       '_task_id': task_id, '_task_step': idx,
+                       '_review': 'Compiler-directed repair. Review changes before approving.'}
+            action_id = self.queue_approval('write_file', payload,
+                f'Task {task_id}: approve repair of {filename} (attempt {attempts + 1}/2)')
+            plan['_repair_attempts'] = attempts + 1
+            plan['_repair_stage'] = 'write'
+            self.store.update(task_id, plan=plan, status='waiting_approval', approval_id=action_id,
+                note='Compiler error diagnosed. Proposed source replacement awaits approval.')
+            return (f'Task `{task_id}` could not compile. Proposed repair {attempts + 1}/2 '
+                    f'awaits overwrite approval `{action_id}`; no file changed.')
+        except Exception as exc:
+            self.store.update(task_id, status='failed', approval_id='',
+                note=f'Compile failed; repair proposal unavailable: {type(exc).__name__}: {exc}'[:450])
+            return f'Task `{task_id}` failed compilation. Could not safely propose a repair: {exc}'
+
     def after_decision(self,action_id,approved,success,result):
         with self.lock():
             task=self.store.active()
@@ -253,19 +337,26 @@ class TaskManager:
                 if not task or task['steps'][task['step_index']]['kind']!='run': return ''
                 found=self.approval_lookup(task['id'],task['step_index'])
                 if not found or found[0]!=action_id:return ''
+            is_repair = task['plan'].get('_repair_stage') == 'write'
             if not approved:
-                self.store.update(task['id'],status='cancelled',note='Execution approval denied; task stopped.',approval_id='')
+                self.store.update(task['id'],status='cancelled',note='Execution or repair approval denied; task stopped.',approval_id='')
                 return f"Task `{task['id']}` stopped because approval was denied."
             if not success:
                 self.store.update(task['id'],status='failed',note='Approved operation failed: '+str(result)[:250],approval_id='')
                 return f"Task `{task['id']}` stopped: approved operation failed."
+            if is_repair:
+                plan = task['plan']; plan['_repair_stage'] = 'rerun'
+                self.store.update(task['id'], plan=plan, status='active', approval_id='',
+                                  note='Approved repair written; simulation requires separate approval.')
+                return self._advance(task['id'])
             return self._apply_run_result(task['id'],task['step_index'],result)
 
     def may_execute(self,task_id,step_index,action_id):
         task=self.store.get(task_id)
         if not task or task['status'] in ('cancelled','failed','completed'):
             return False
-        return task['step_index']==step_index and task['steps'][step_index]['kind']=='run' and (
+        return (0 <= step_index < len(task['steps']) and
+                task['step_index']==step_index and task['steps'][step_index]['kind']=='run') and (
             not task['approval_id'] or task['approval_id']==action_id)
 
     def resume(self):

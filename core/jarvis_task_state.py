@@ -61,6 +61,7 @@ class TaskStore:
     def update(self, task_id, **fields):
         fields['updated_at']=time.time()
         if 'steps' in fields: fields['steps']=json.dumps(fields['steps'])
+        if 'plan' in fields: fields['plan']=json.dumps(fields['plan'])
         with self.db() as db:
             db.execute('UPDATE tasks SET '+','.join(f'{key}=?' for key in fields)+' WHERE id=?',
                        [*fields.values(),task_id])

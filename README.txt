@@ -1,28 +1,18 @@
-JARVIS Verified Sequence Detector Repair (v1)
+JARVIS Compiler Repair Proposal Fix v1.1
 
-Fixes: deterministic specification-derived overlapping Moore sequence detectors
-with active-low reset; independent sliding-window testbenches; refuses known
-invalid Verilog ternary/system-task syntax in model-generated testbenches.
+This targeted patch changes ONLY core/jarvis_task_repair.py.
+- Known missing standalone $finish semicolon near actual compiler diagnostics: propose minimal repair without asking the model.
+- Other compile errors: retry one invalid/unchanged model proposal with stricter instructions.
+- Never overwrite source or execute a program here; existing approval flow remains mandatory.
+- Never silently accept an unchanged repair or wrong filename.
+- Existing failed tasks remain in history; run /task test-repair to create a fresh disposable task.
 
-This is a focused fix to the demonstrated pattern-detector failure, NOT a
-fully general autonomous compiler-driven repair system. Code generation for
-other novel Verilog/Python projects still relies on Ollama and can be wrong.
-
-Stop JARVIS, then from WSL:
+Install (stop JARVIS first):
   cd ~/JARVIS
-  unzip -o /mnt/c/Users/lukej/Downloads/JARVIS_Verified_Sequence_Repair.zip -d .
+  unzip -o /mnt/c/Users/lukej/Downloads/JARVIS_Repair_Proposal_Fix_V1_1.zip -d .
   source .venv/bin/activate
-  python -m unittest -v test_sequence_repair.py
-  python install_sequence_repair.py
+  python install_repair_validation.py
+  python -m unittest -v test_repair_validation.py
   bash start_jarvis.sh
 
-Test (new project, not an overwrite):
-  /task Create a Verilog sequence detector for 1011, write a self-checking
-  testbench, simulate it, and verify the results.
-
-Approve execution when JARVIS requests it; the template itself never executes
-code. Verification PASS depends on the approved simulation actually passing.
-
-No automatic repair of previous broken projects; no changes to JARVIS
-chat/Discord routing or existing task approvals. Installer refuses if local
-planner differs from user's uploaded source, with a backup on success.
+If installation refuses a checksum mismatch, do not force overwrite: provide the current core/jarvis_task_repair.py.
