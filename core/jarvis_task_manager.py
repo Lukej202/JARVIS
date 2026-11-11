@@ -137,12 +137,14 @@ class TaskManager:
             except (PlanningError,TaskError,ValueError) as exc:
                 return f'Task planning stopped: {exc} No new files were created.'
 
-    def start_repair_test(self):
-        """Create a disposable project with one known testbench syntax error.
+    def start_repair_test(self, variant='semicolon'):
+        """Create a disposable project with an intentional compiler error.
 
-        No existing files are modified. Compilation, repair overwrite, and
-        second compilation still go through the normal approval pipeline.
+        This only creates NEW files. Repairs and simulations use the normal
+        approval workflow; existing projects are not modified.
         """
+        if variant not in ('semicolon', 'port', 'signal'):
+            return 'Unknown repair test variant.'
         from core.jarvis_task_planner import _counter_plan
         if self.store.active():
             return 'Another autonomous task is active. Use /task status or /task cancel.'
@@ -150,16 +152,32 @@ class TaskManager:
         plan = _counter_plan(objective)
         if plan is None:
             return 'Repair test unavailable: trusted counter fixture is missing.'
-        plan['project'] = 'repair_demo_' + secrets.token_hex(4)
+        plan['project'] = ('repair_demo_' if variant == 'semicolon' else 'repair_' + variant + '_') + secrets.token_hex(4)
         tb_name = plan['run']['testbench']
-        matches = [item for item in plan['files'] if item['path'] == tb_name]
-        if len(matches) != 1:
-            return 'Repair test unavailable: unexpected testbench fixture.'
-        original = matches[0]['content']
-        if original.count('        $finish;') != 1:
-            return 'Repair test unavailable: cannot identify the expected syntax-error location.'
-        matches[0]['content'] = original.replace('        $finish;', '        $finish', 1)
+        rtl_name = plan['run']['filename']
+        tb = [item for item in plan['files'] if item['path'] == tb_name]
+        rtl = [item for item in plan['files'] if item['path'] == rtl_name]
+        if len(tb) != 1 or len(rtl) != 1:
+            return 'Repair test unavailable: unexpected counter fixture.'
+        if variant == 'semicolon':
+            source = tb[0]['content']
+            if source.count('        $finish;') != 1:
+                return 'Repair test unavailable: cannot locate $finish fixture.'
+            tb[0]['content'] = source.replace('        $finish;', '        $finish', 1)
+        elif variant == 'port':
+            source = tb[0]['content']
+            if source.count('.clk(clk)') != 1:
+                return 'Repair test unavailable: cannot locate port fixture.'
+            tb[0]['content'] = source.replace('.clk(clk)', '.clock_invalid(clk)', 1)
+        else:
+            source = rtl[0]['content']
+            if source.count("count <= count + 4'd1;") != 1:
+                return 'Repair test unavailable: cannot locate signal fixture.'
+            rtl[0]['content'] = ('`default_nettype none\n' +
+                source.replace("count <= count + 4'd1;", "count <= missing_signal + 4'd1;", 1) +
+                '`default_nettype wire\n')
         plan['_repair_test'] = True
+        plan['_repair_test_kind'] = variant
         with self.lock():
             if self.store.active():
                 return 'Another autonomous task is active. Use /task status or /task cancel.'
@@ -169,7 +187,7 @@ class TaskManager:
                 self.store.create(task_id, objective, plan, steps)
                 outcome = self._advance(task_id)
                 return ('Repair test created a NEW disposable project with a deliberately '
-                        'broken testbench.\n' + outcome +
+                        'broken Verilog source (' + variant + ').\n' + outcome +
                         '\nApprove the initial simulation to trigger compiler diagnostics.')
             except (PlanningError, TaskError, ValueError) as exc:
                 return f'Repair test stopped: {exc} No existing projects were modified.'

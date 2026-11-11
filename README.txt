@@ -1,18 +1,21 @@
-JARVIS Compiler Repair Proposal Fix v1.1
+JARVIS General Repair Test Commands — compatibility edition
 
-This targeted patch changes ONLY core/jarvis_task_repair.py.
-- Known missing standalone $finish semicolon near actual compiler diagnostics: propose minimal repair without asking the model.
-- Other compile errors: retry one invalid/unchanged model proposal with stricter instructions.
-- Never overwrite source or execute a program here; existing approval flow remains mandatory.
-- Never silently accept an unchanged repair or wrong filename.
-- Existing failed tasks remain in history; run /task test-repair to create a fresh disposable task.
+Built from your uploaded jarvis_current_sources.zip.
 
-Install (stop JARVIS first):
-  cd ~/JARVIS
-  unzip -o /mnt/c/Users/lukej/Downloads/JARVIS_Repair_Proposal_Fix_V1_1.zip -d .
+New commands:
+  /task test-repair-port    -> testbench with incorrect named port
+  /task test-repair-signal  -> RTL with undeclared signal
+Existing /task test-repair remains available.
+
+Only jarvis_core.py and core/jarvis_task_manager.py are changed.
+
+Installation from ~/JARVIS after stopping JARVIS:
+  unzip -o /mnt/c/Users/lukej/Downloads/JARVIS_General_Repair_Compatible.zip -d .
   source .venv/bin/activate
-  python install_repair_validation.py
-  python -m unittest -v test_repair_validation.py
+  python install_general_repair_compatible.py
+  python -m unittest -v test_general_repair_tests.py
   bash start_jarvis.sh
 
-If installation refuses a checksum mismatch, do not force overwrite: provide the current core/jarvis_task_repair.py.
+These are deliberately broken, disposable projects. You must still approve
+execution, repair overwrites, and reruns separately. Two repair attempts max.
+Test commands are diagnostic; model-generated corrections are not guaranteed.
