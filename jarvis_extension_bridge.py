@@ -175,25 +175,7 @@ def receive_result(payload: dict[str, Any]) -> bool:
                     continue
                 pages.append({'title': str(page.get('title', ''))[:240],
                               'url': url, 'preview': str(page.get('preview', ''))[:6500]})
-            # AI Overview is optional, untrusted Google-generated text.
-            # Preserve a bounded excerpt and public HTTPS citations only.
-            raw_overview = data.get('overview')
-            overview = None
-            if isinstance(raw_overview, dict):
-                summary = str(raw_overview.get('text', '')).strip()[:2800]
-                cited_sources = []
-                for link in raw_overview.get('sources', [])[:8] if isinstance(raw_overview.get('sources'), list) else []:
-                    if not isinstance(link, dict):
-                        continue
-                    address = str(link.get('url', ''))[:2048]
-                    parsed_link = urlsplit(address)
-                    if (parsed_link.scheme != 'https' or not parsed_link.hostname or
-                            parsed_link.hostname.lower().endswith('.google.com')):
-                        continue
-                    cited_sources.append({'title': str(link.get('title', ''))[:130], 'url': address})
-                if len(summary) >= 110:
-                    overview = {'text': summary, 'sources': cited_sources}
-            report = {'query': job['query'], 'pages': pages, 'overview': overview,
+            report = {'query': job['query'], 'pages': pages,
                       'errors': [str(x)[:220] for x in data.get('errors', [])[:6]],
                       'stopped': bool(data.get('stopped'))}
             error = ''

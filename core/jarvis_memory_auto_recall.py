@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from jarvis_verified_memory import list_confirmed_facts
+from core.jarvis_verified_memory import list_confirmed_facts
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _STOP = frozenset(

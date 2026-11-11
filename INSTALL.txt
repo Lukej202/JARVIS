@@ -1,0 +1,21 @@
+JARVIS STAGED PLANNER V2
+
+Stop JARVIS with Ctrl+C, then in WSL:
+  cd ~/JARVIS
+  unzip -o /mnt/c/Users/lukej/Downloads/JARVIS_Staged_Planner_V2.zip -d .
+  source .venv/bin/activate
+  python -m unittest -v test_staged_planner.py
+  python install_staged_planner.py
+  bash start_jarvis.sh
+
+Try:
+  /task Create a Verilog sequence detector for 1011, write a self-checking testbench, simulate it, and verify the results.
+
+This patch replaces core/jarvis_task_planner.py ONLY. It backs up the original.
+The manager still creates new projects only and requires execution approval.
+The planner now uses separate model calls for RTL and its self-checking testbench.
+HTTP 500 response details are included in the error. No external commands are executed by planning.
+
+Limitations: It does not yet provide compiler-driven automatic repair, and a PASS
+message is only as trustworthy as the generated self-checking testbench.
+Review generated source before approving execution.

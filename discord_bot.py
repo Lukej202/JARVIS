@@ -114,10 +114,12 @@ async def on_message(message):
             new_actions = [a for a in await asyncio.to_thread(pending_actions)
                            if a['id'] not in existing_ids]
             for action in new_actions:
+                # The primary response already includes this ID for /task.
+                if f"{action['id']}" in response:
+                    continue
                 await message.channel.send(
-                    f"Approval needed: `{action['id']}` — {str(action['summary'])[:500]}\n"
-                    f"Use `/review {action['id']}` before `/approve {action['id']}` "
-                    f"or `/deny {action['id']}`."
+                    f"Action waiting for approval: `{action['id']}`. "
+                    f"Use `/review {action['id']}` for details."
                 )
 
         except Exception as exc:

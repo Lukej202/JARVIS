@@ -32,6 +32,43 @@ def _source(root: Path, relative: str, allowed: tuple[str, ...]) -> Path:
     return path
 
 
+def _declared_modules(source: Path) -> list[str]:
+    """Find module declarations in a testbench, ignoring comments and strings.
+
+    This is a lightweight declaration scan, not a Verilog parser. If the
+    declaration is ambiguous, refuse rather than selecting the design top.
+    """
+    contents = source.read_text(encoding="utf-8", errors="replace")
+    # Preserve code boundaries while excluding comment/string text.
+    token_re = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"', re.MULTILINE)
+    stripped = token_re.sub(lambda m: " " * len(m.group()), contents)
+    return re.findall(r"\bmodule\s+(?:automatic\s+|static\s+)?([A-Za-z_][A-Za-z0-9_$]*)\b", stripped)
+
+
+def _testbench_top(tb: Path, requested: str) -> str:
+    """Infer simulation top from actual modules in the testbench file.
+
+    Ignore a model-supplied DUT name. Never pick an unrelated module.
+    """
+    names = list(dict.fromkeys(_declared_modules(tb)))
+    if not names:
+        raise ValueError(f"No module declaration found in testbench {tb.name}.")
+    if len(names) == 1:
+        return names[0]
+    # A testbench may also contain helper modules. Prefer a single clearly
+    # named TB; do not silently guess when multiple candidates remain.
+    tb_names = [name for name in names if re.search(r"(?:_tb|_testbench)$", name, re.I)]
+    if len(tb_names) == 1:
+        return tb_names[0]
+    if requested in names and requested in tb_names:
+        return requested
+    raise ValueError(
+        f"Testbench {tb.name} defines multiple modules ({', '.join(names)}). "
+        "Cannot identify a unique simulation top; use a single top-level "
+        "testbench module or an unambiguous *_tb name."
+    )
+
+
 def validate_request(root: Path, filename: str, testbench: str = "", top_module: str = "") -> dict:
     root = root.resolve()
     if not isinstance(filename, str):
@@ -46,16 +83,17 @@ def validate_request(root: Path, filename: str, testbench: str = "", top_module:
         raise ValueError("Only .py, .v and .sv are supported.")
     source = _source(root, filename, (".v", ".sv"))
     tb = _source(root, testbench, (".v", ".sv")) if testbench else None
-    if top_module and not TOP_RE.fullmatch(top_module):
+    if top_module and (not isinstance(top_module, str) or not TOP_RE.fullmatch(top_module)):
         raise ValueError("Invalid top-level module name.")
-    if tb and not top_module:
-        raise ValueError("Specify the testbench top_module, e.g. counter_tb.")
     if not tb and top_module:
         raise ValueError("Provide testbench when specifying top_module.")
     if tb and tb == source:
         raise ValueError("Design source and testbench must be different files.")
+    # The *declared module* inside the testbench is the simulation top; the
+    # LLM's top_module argument is advisory, not authoritative.
+    resolved_top = _testbench_top(tb, top_module) if tb else ""
     return {"language": "verilog", "filename": str(source.relative_to(root)),
-            "testbench": str(tb.relative_to(root)) if tb else "", "top_module": top_module}
+            "testbench": str(tb.relative_to(root)) if tb else "", "top_module": resolved_top}
 
 
 def _run(argv: list[str], *, cwd: Path) -> tuple[int, str]:

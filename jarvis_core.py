@@ -143,11 +143,10 @@ def _request_approval(kind: str, payload: dict, summary: str) -> str:
                 "INSERT INTO actions VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
                 (action_id, kind, raw_payload, summary, time.time()),
             )
-    return (
-        f"Approval required for {summary}. Action ID: {action_id}. "
-        "Nothing has been changed yet. Ask the user to approve or deny "
-        "this action using the browser approval panel or /approve ID in terminal."
-    )
+        return (
+            f"Action waiting for approval. "
+            f"Check the approval panel. ID: {action_id}"
+        )
 
 
 def pending_actions() -> list[dict]:
@@ -163,7 +162,7 @@ def pending_actions() -> list[dict]:
             "id": action_id,
             "kind": kind,
             "summary": summary,
-            "content": payload.get("content", payload.get("text", "")),
+            "content": payload.get("content", payload.get("text", payload.get("_review", ""))),
         })
     return results
 
@@ -312,6 +311,57 @@ def _run_approved_action(kind: str, payload: dict) -> str:
     raise ValueError("Unknown action: " + kind)
 
 
+# JARVIS_SUPERVISED_TASKS_V1: local bounded /task workflows.
+def _task_manager():
+    from core.jarvis_task_manager import TaskManager
+
+    def find_approval(task_id: str, step_index: int):
+        with _actions_connection() as db:
+            rows = db.execute(
+                "SELECT id, status, result, payload FROM actions "
+                "WHERE kind='run_workspace_program' ORDER BY created_at DESC LIMIT 1000"
+            ).fetchall()
+        for action_id, status, result, payload in rows:
+            try:
+                info = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if info.get('_task_id') == task_id and info.get('_task_step') == step_index:
+                return action_id, status, result
+        return None
+
+    def queue(kind, payload, summary):
+        response = _request_approval(kind, payload, summary)
+        match = re.search(r'ID: ([a-f0-9]{12})', response)
+        if not match:
+            raise RuntimeError('Unable to obtain approval ID.')
+        return match.group(1)
+
+    return TaskManager(WORKSPACE, approval_lookup=find_approval,
+                       queue_approval=queue, log_action=_log_automatic_action)
+
+
+def _task_command(message: str) -> str:
+    command = message.strip()[len('/task'):].strip()
+    manager = _task_manager()
+    if not command or command.lower() == 'help':
+        return ('Use /task followed by a Python or Verilog project objective. '
+                'Commands: /task status, /task resume, /task cancel.')
+    if command.lower() == 'status':
+        return manager.status()
+    if command.lower() == 'resume':
+        return manager.resume()
+    if command.lower() == 'cancel':
+        result, action_id = manager.cancel()
+        if action_id:
+            with _actions_connection() as db:
+                db.execute("UPDATE actions SET status='denied', result=? "
+                           "WHERE id=? AND status='pending'",
+                           ('Cancelled by user through /task cancel.', action_id))
+        return result
+    return manager.start(command, MODEL_NAME, OLLAMA_API)
+
+
 def decide_action(action_id: str, approved: bool) -> str:
     """Atomic one-time approval/denial; can be called from terminal or browser."""
     with _conversation_lock():
@@ -326,6 +376,12 @@ def decide_action(action_id: str, approved: bool) -> str:
             kind, raw_payload, summary, status = row
             if status != "pending":
                 raise ValueError(f"This action is already {status}.")
+            task_payload = json.loads(raw_payload)
+            if task_payload.get('_task_id') and not _task_manager().may_execute(
+                    task_payload['_task_id'], task_payload.get('_task_step'), action_id):
+                db.execute("UPDATE actions SET status='denied', result=? WHERE id=?",
+                           ('Autonomous task cancelled or no longer at this step.', action_id))
+                return 'This task approval is no longer valid. No action was executed.'
             db.execute("UPDATE actions SET status=? WHERE id=?",
                        ("executing" if approved else "denied", action_id))
 
@@ -334,6 +390,10 @@ def decide_action(action_id: str, approved: bool) -> str:
             with _actions_connection() as db:
                 db.execute("UPDATE actions SET result=? WHERE id=?", (message, action_id))
             _record_outcome(summary, message)
+            if task_payload.get('_task_id'):
+                task_result = _task_manager().after_decision(action_id, False, False, message)
+                if task_result:
+                    message += "\n" + task_result
             return message
 
         try:
@@ -349,6 +409,11 @@ def decide_action(action_id: str, approved: bool) -> str:
             db.execute("UPDATE actions SET status=?, result=? WHERE id=?",
                        (status, result, action_id))
         _record_outcome(summary, result)
+        if task_payload.get('_task_id'):
+            # JARVIS_TASK_REPORTING_V1: return state-derived task summary.
+            task_result = _task_manager().after_decision(action_id, True, status == 'completed', result)
+            if task_result:
+                return task_result
         return result
 
 
@@ -781,7 +846,9 @@ jarvis = Agent(
         "these tools execute immediately and return verification. No approval is needed for them. "
         "Existing file overwrites through write_file, Notepad typing, screen capture, "
         "and other protected operations still QUEUE approval requests. "
-        "Tell the user the approval ID when queued; never claim an unapproved action ran. "
+        "When an action requires approval, briefly tell the user it is waiting "
+        "for approval. Do not repeat the action parameters or explain the approval "
+        "process unless asked. Never claim an unapproved action ran. "
         "Never claim a file exists unless a tool confirms it was created or read. "
         "If a tool reports a failure, explain the failure instead of claiming success. "
         "Do not repeat an action after it is queued; wait for approval. "
@@ -835,6 +902,10 @@ def run_turn(message: str) -> str:
         raise ValueError("Messages must be under 4,000 characters.")
 
     message = message.strip()
+
+    # Explicit opt-in only: ordinary conversation and file tools are unchanged.
+    if re.match(r'^/task(?:\s|$)', message, re.IGNORECASE):
+        return _task_command(message)
 
     # M14_VERIFIED_MEMORY: explicit memory commands have deterministic routing.
     # Never save content based on the model's interpretation of chat or web results.

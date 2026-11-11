@@ -1,0 +1,26 @@
+    def _apply_run_result(self,task_id,idx,result):
+        # JARVIS_TASK_REPORTING_V1: deterministic report, no additional LLM calls.
+        result = str(result or '')
+        task = self.store.get(task_id)
+        if not task:
+            return 'Task not found; review action history.'
+        match = re.search(r'(?:Simulation exit code|Exit code):\s*(-?\d+)', result)
+        if result.startswith('Verilog compile FAILED') or match is None or int(match.group(1)) != 0:
+            self.store.update(task_id,status='failed',approval_id='',note='Execution failed; full diagnostics in the action history.')
+            return f'Task `{task_id}` failed during execution. Review the action history.'
+        if re.search(r'(?im)^\s*(?:FAIL(?:ED)?\b|ERROR\s*:)', result):
+            self.store.update(task_id,status='failed',approval_id='',note='Self-checking testbench reported failure.')
+            return f'Task `{task_id}` failed verification. Review the action history.'
+        is_verilog = task['plan'].get('language') == 'verilog'
+        passed = is_verilog and bool(re.search(r'(?im)^\s*PASS\s*:', result))
+        waveform = re.search(r'(?m)^Waveform\(s\):\s*(.+)$', result)
+        note = ('Testbench reported PASS.' if passed else 'Execution succeeded; correctness not independently verified.')
+        if waveform:
+            note += ' Waveform: ' + waveform.group(1)[:180]
+        self.store.update(task_id,step_index=idx+1,status='active',approval_id='',note=note)
+        self._advance(task_id)
+        self.store.update(task_id,note=note)
+        message = f'Task `{task_id}` completed. ' + ('Verification: PASS.' if passed else 'Execution passed; verification unconfirmed.')
+        if waveform:
+            message += ' Waveform: ' + waveform.group(1)[:180]
+        return message
