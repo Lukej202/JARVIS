@@ -42,6 +42,7 @@ from agents import (
     Agent, AsyncOpenAI, OpenAIChatCompletionsModel, Runner, ModelSettings,
     SQLiteSession, function_tool, set_tracing_disabled,
 )
+from agents.exceptions import ModelBehaviorError
 
 # M14_VERIFIED_MEMORY: local, explicitly user-approved facts only.
 from jarvis_verified_memory import (
@@ -56,7 +57,7 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 MEMORY_DB = ROOT / "jarvis_memory.db"   # Reuses the existing terminal chat history
 ACTIONS_DB = ROOT / "jarvis_actions.db"
 LOCK_FILE = ROOT / "jarvis_session.lock"
-MODEL_NAME = os.getenv("JARVIS_MODEL", "qwen3:4b")
+MODEL_NAME = os.getenv("JARVIS_MODEL", "qwen3.5:4b")
 VISION_MODEL = os.getenv("JARVIS_VISION_MODEL", "gemma3:4b")
 OLLAMA_API = "http://127.0.0.1:11434"
 
@@ -71,7 +72,7 @@ _client = AsyncOpenAI(
 _session = SQLiteSession(
     os.getenv("JARVIS_SESSION_ID", "jarvis_main"),
     str(MEMORY_DB),
-    session_settings={"limit": 40},
+    session_settings={"limit": 16},
 )
 _local_lock = RLock()
 
@@ -174,55 +175,6 @@ def _record_outcome(summary: str, result: str) -> None:
     }]))
 
 
-def _run_browser_research_v2(question: str) -> str:
-    """Use the bounded planner, Chrome bridge, and evidence-based report writer.
-
-    Kept separate from the legacy single-query implementation so rollback is
-    possible with JARVIS_RESEARCH_V2=0. This does not grant any new permissions.
-    """
-    from jarvis_research import conduct_research
-    from jarvis_research_summarizer_v2 import (
-        extract_evidence, evaluate_evidence, generate_final_report,
-    )
-
-    report = conduct_research(question)
-    sources = report.get("pages", [])[:3]
-    errors = list(report.get("errors", []))
-    stopped = bool(report.get("stopped"))
-    findings = []
-
-    # When the user stops browsing, do not continue with new model work.
-    if stopped:
-        return "Research stopped. No final report was generated."
-    if not sources:
-        details = "; ".join(str(e)[:220] for e in errors[:3])
-        return "Research found no readable source pages." + (" " + details if details else "")
-
-    for source_id, page in enumerate(sources, 1):
-        try:
-            extracted = extract_evidence(question, page, source_id)
-            findings.extend(evaluate_evidence(question, extracted))
-        except Exception as exc:
-            # A bad webpage or model output must not erase other usable evidence.
-            errors.append(f"Source [{source_id}] could not be evaluated: {type(exc).__name__}")
-
-    supported_count = sum(item.get("verdict") == "supported" for item in findings)
-    answer = generate_final_report(question, findings)
-    source_list = "\n\nSources actually opened:\n" + "\n".join(
-        f"[{i}] {str(p.get('title', 'Untitled'))[:200]} — {p.get('url', '')}"
-        for i, p in enumerate(sources, 1)
-    )
-    status = (
-        f"\n\nEvidence screening: {supported_count}/{len(findings)} findings "
-        "classified supported by the local model (not independently verified)."
-    )
-    error_note = (
-        "\nResearch limitations: " + "; ".join(str(e)[:220] for e in errors[:3])
-        if errors else ""
-    )
-    return answer + status + source_list + error_note
-
-
 def _run_approved_action(kind: str, payload: dict) -> str:
     # M14_VERIFIED_MEMORY: permanent memory changes only after existing UI approval.
     if kind == "remember_fact":
@@ -319,6 +271,7 @@ def _run_approved_action(kind: str, payload: dict) -> str:
                 "Do not claim to have browsed other pages."
             ),
             tools=[],
+            model_settings=NO_THINK_SETTINGS,
         )
         prompt = (
             f"User's question: {question}\n"
@@ -333,41 +286,21 @@ def _run_approved_action(kind: str, payload: dict) -> str:
 
     # M13_BROWSER_CONTROL: approved, read-only multi-page browser research.
     if kind == "browser_research":
-        # Default to the tested v2 pipeline for the standard three-page request.
-        # For smaller page budgets retain legacy behavior until the coordinator
-        # supports a configurable session-wide page limit.
-        if os.getenv("JARVIS_RESEARCH_V2", "1") != "0" and int(payload["pages"]) == 3:
-            return _run_browser_research_v2(payload["query"])
+        import json as _json
         from jarvis_extension_bridge import enqueue_research
         report = enqueue_research(payload["query"], max_pages=int(payload["pages"]))
         sources = report.get("pages", [])
-        overview = report.get("overview")
-        if not sources and not (isinstance(overview, dict) and overview.get("text")):
+        if not sources:
             return ("Browser research " + ("was stopped. " if report.get("stopped") else "found no readable pages. ")
                     + " ".join(report.get("errors", []))[:800])
         from jarvis_research_summarizer import summarize_research
-        if isinstance(overview, dict) and str(overview.get("text", "")).strip():
-            # Fast path: show Google's VISIBLE AI Overview, attributed as an
-            # AI-generated summary, not falsely described as verified facts.
-            # Avoid a second Ollama summarization round trip.
-            overview_text = " ".join(str(overview["text"]).split())[:1800]
-            answer = ("Google AI Overview (AI-generated; claims not independently verified):\n"
-                      + overview_text)
-            if not sources:
-                answer += "\n\nNo source pages could be independently opened."
-            else:
-                answer += "\n\nRelated source pages were opened; review the links below to verify claims."
-        else:
-            answer = clean_model_output(summarize_research(report, model=MODEL_NAME, ollama_api=OLLAMA_API))
+        answer = clean_model_output(summarize_research(report, model=MODEL_NAME, ollama_api=OLLAMA_API))
         prefix = "Research stopped early; partial findings below.\n" if report.get("stopped") else ""
         errors = "\nPages that could not be read: " + "; ".join(report["errors"][:3]) if report.get("errors") else ""
-        source_list = ("\n\nSources actually opened:\n" + "\n".join(
+        source_list = "\n\nSources actually opened:\n" + "\n".join(
             f"[{i}] {p['title']} — {p['url']}" for i, p in enumerate(sources, 1)
-        )) if sources else ""
-        cited = overview.get("sources", []) if isinstance(overview, dict) else []
-        cited_list = ("\n\nLinks cited by Google's AI Overview (not independently verified):\n" +
-                      "\n".join(f"- {item['title']} — {item['url']}" for item in cited[:5])) if cited else ""
-        return prefix + answer + source_list + cited_list + errors
+        )
+        return prefix + answer + source_list + errors
 
     raise ValueError("Unknown action: " + kind)
 
@@ -769,7 +702,32 @@ def _queue_browser_research(query: str, pages: int = 3) -> str:
     except Exception as exc:
         return f"Browser research failed: {type(exc).__name__}: {exc}"
 
-
+@function_tool
+def run_python_program(code: str) -> str:
+    """Run a Python program in the WSL JARVIS workspace. Returns stdout and stderr."""
+    if not code.strip():
+        return "Provide a Python program to run."
+    if len(code) > 30000:
+        return "Program exceeds 30,000 characters."
+    try:
+        path = WORKSPACE / f"temp_{secrets.token_hex(4)}.py"
+        path.write_text(code, encoding="utf-8")
+        result = subprocess.run(
+            ["python3", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(WORKSPACE),
+        )
+        output = result.stdout.strip() or result.stderr.strip() or "No output."
+        return f"Program exited with code {result.returncode}.\nOutput:\n{output[:10000]}"
+    except Exception as err:
+        return f"Python execution failed: {type(err).__name__}: {err}"
+    finally:
+        try:
+            path.unlink()
+        except Exception:
+            pass
 @function_tool
 def research_in_chrome(query: str, pages: int = 3) -> str:
     """Research 1–3 public pages in extension-created Chrome tabs. No personal tabs, forms, or downloads."""
@@ -786,25 +744,25 @@ def recall_user_memory(topic: str = "") -> str:
     return "\n".join(f"[{record['id']}] {record['fact']}" for record in matches)
 
 
-# Ollama connection for JARVIS
-ollama_client = AsyncOpenAI(
-    base_url="http://127.0.0.1:11434/v1/",
-    api_key="ollama",
+# All JARVIS agents share the same local Ollama client and selected model.
+# The SDK's Reasoning(effort="none") maps to reasoning_effort="none".
+ollama_client = _client
+ollama_model = OpenAIChatCompletionsModel(
+    model=MODEL_NAME,
+    openai_client=ollama_client,
 )
 
-ollama_model = OpenAIChatCompletionsModel(
-    model=os.getenv("JARVIS_MODEL", "qwen3.5:4b"),
-    openai_client=ollama_client,
+# Apply this to subsidiary webpage agents as well as the main chat agent.
+NO_THINK_SETTINGS = ModelSettings(
+    max_tokens=2048,
+    reasoning=Reasoning(effort="none"),
 )
 
 
 jarvis = Agent(
     name="JARVIS",
     model=ollama_model,
-    model_settings=ModelSettings(
-        max_tokens=1536,
-        reasoning=Reasoning(effort="none"),
-    ),
+    model_settings=NO_THINK_SETTINGS,
 
     instructions=(
         "You are JARVIS, a friendly, concise personal desktop assistant. "
@@ -834,21 +792,31 @@ jarvis = Agent(
 
         "When summarizing a webpage, include its source URL. "
 
-        "The search_web tool opens Google Chrome; it does not return "
-        "search results or webpage contents. "
+        "For public research, only use managed research_in_chrome extension tabs. "
         "Never attempt to read existing personal Chrome tabs. "
-        "Research must use new tabs created by the paired extension. "
+        "Research uses new tabs created by the paired extension. "
         "For multi-page public internet research, use research_in_chrome; public research runs automatically. "
         "It opens only JARVIS-created research tabs in the user's regular Chrome window through the paired extension. "
-        "Never claim research completed before the tool returns results. Do not log in, buy, submit forms or download."
+        "Never claim research completed without source results. Do not log in, buy, submit forms or download."
     ),
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, search_web, read_web_page, research_in_chrome, recall_user_memory
+        create_folder, create_file, write_file, type_in_notepad, inspect_screen, read_web_page, research_in_chrome, recall_user_memory
     ],
 )
 
+
+
+def _is_safe_explanation_question(message: str) -> bool:
+    """Only permit a tool-free recovery for unmistakably informational prompts."""
+    text = re.sub(r"^\s*(?:hey[, ]+)?jarvis[,!: ]+", "", message, flags=re.I).strip()
+    if not re.match(r"^(?:explain|describe|compare|define|what is|what are|why |how does|how do |difference between|tell me about)\b", text, re.I):
+        return False
+    # No retries for commands that could create/change state, or for research.
+    if re.search(r"\b(?:create|save|write|edit|change|remove|delete|launch|open|run|execute|install|approve|remember|forget|research|search|browse|webpage|website|file|folder|workspace|chrome|my screen)\b", text, re.I):
+        return False
+    return True
 
 
 def run_turn(message: str) -> str:
@@ -953,6 +921,7 @@ def run_turn(message: str) -> str:
                 "content has been supplied."
             ),
             tools=[],
+            model_settings=NO_THINK_SETTINGS,
         )
 
         prompt = (
@@ -989,13 +958,49 @@ def run_turn(message: str) -> str:
             jarvis.clone(instructions=jarvis.instructions + "\n\n" + memory_context)
             if memory_context else jarvis
         )
-        result = Runner.run_sync(
-            active_agent, message, session=_session, max_turns=7
-        )
-        return clean_model_output(
-            result.final_output
-            or "I couldn't complete that request."
-        )
+        try:
+            result = Runner.run_sync(
+                active_agent, message, session=_session, max_turns=7
+            )
+        except ModelBehaviorError as exc:
+            # A local model can exhaust its output budget before forming a tool
+            # call. Do NOT retry a tool-enabled run: an earlier tool may have
+            # succeeded, and retrying could perform an action twice.
+            print(f"[JARVIS MODEL] {type(exc).__name__}: {exc}", flush=True)
+            if _is_safe_explanation_question(message):
+                # Only retry clearly explanatory questions, without tools or
+                # access to the mutable conversation session.
+                fallback = Agent(
+                    name="JARVIS Explanation Recovery",
+                    model=ollama_model,
+                    model_settings=NO_THINK_SETTINGS,
+                    instructions=(
+                        "You are JARVIS. Answer the user's educational question "
+                        "directly and concisely. Do not use tools or claim to "
+                        "have performed actions. Finish every sentence and "
+                        "close any code blocks."
+                    ),
+                    tools=[],
+                )
+                try:
+                    retried = Runner.run_sync(fallback, message, max_turns=1)
+                    answer = clean_model_output(retried.final_output or "")
+                    if answer and not answer.startswith("I couldn't produce"):
+                        asyncio.run(_session.add_items([
+                            {"role": "user", "content": message},
+                            {"role": "assistant", "content": answer},
+                        ]))
+                        return answer
+                except Exception as recovery_exc:
+                    print(f"[JARVIS RECOVERY] {type(recovery_exc).__name__}", flush=True)
+            return (
+                "My local model ran out of generation capacity before completing "
+                "that request. I didn't repeat any tools or actions. "
+                "Please retry with a shorter request; if it involved a file, "
+                "check the workspace before retrying."
+            )
+
+        return clean_model_output(result.final_output or "I couldn't complete that request.")
 
 
 
