@@ -19,7 +19,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import re
-from jarvis_output import clean_model_output
+from core.jarvis_output import clean_model_output
 
 from agents import (
     AsyncOpenAI,
@@ -45,11 +45,11 @@ from agents import (
 from agents.exceptions import ModelBehaviorError
 
 # M14_VERIFIED_MEMORY: local, explicitly user-approved facts only.
-from jarvis_verified_memory import (
+from core.jarvis_verified_memory import (
     add_confirmed_fact, remove_confirmed_fact,
     relevant_confirmed_facts, format_memory_list,
 )
-from jarvis_memory_auto_recall import memory_context_for
+from core.jarvis_memory_auto_recall import memory_context_for
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = (ROOT / "workspace").resolve()
