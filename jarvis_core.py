@@ -176,6 +176,13 @@ def _record_outcome(summary: str, result: str) -> None:
 
 
 def _run_approved_action(kind: str, payload: dict) -> str:
+    # JARVIS_WORKSPACE_RUNNER_V1: only the approval dispatcher executes programs.
+    if kind == "run_workspace_program":
+        from jarvis_workspace_runner import execute_approved_program
+        return execute_approved_program(
+            WORKSPACE, payload["filename"], payload.get("testbench", ""),
+            payload.get("top_module", ""),
+        )
     # M14_VERIFIED_MEMORY: permanent memory changes only after existing UI approval.
     if kind == "remember_fact":
         record = add_confirmed_fact(payload["fact"])
@@ -703,31 +710,28 @@ def _queue_browser_research(query: str, pages: int = 3) -> str:
         return f"Browser research failed: {type(exc).__name__}: {exc}"
 
 @function_tool
-def run_python_program(code: str) -> str:
-    """Run a Python program in the WSL JARVIS workspace. Returns stdout and stderr."""
-    if not code.strip():
-        return "Provide a Python program to run."
-    if len(code) > 30000:
-        return "Program exceeds 30,000 characters."
+def run_workspace_program(filename: str, testbench: str = "", top_module: str = "") -> str:
+    """Request user approval to run an existing workspace Python script or compile/simulate Verilog.
+
+    For Python pass filename="script.py". For Verilog compile only, pass
+    filename="design.v". To simulate, also pass testbench="design_tb.v"
+    and top_module="design_tb". Code is never executed until approved.
+    """
+    from jarvis_workspace_runner import validate_request
     try:
-        path = WORKSPACE / f"temp_{secrets.token_hex(4)}.py"
-        path.write_text(code, encoding="utf-8")
-        result = subprocess.run(
-            ["python3", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=str(WORKSPACE),
-        )
-        output = result.stdout.strip() or result.stderr.strip() or "No output."
-        return f"Program exited with code {result.returncode}.\nOutput:\n{output[:10000]}"
-    except Exception as err:
-        return f"Python execution failed: {type(err).__name__}: {err}"
-    finally:
-        try:
-            path.unlink()
-        except Exception:
-            pass
+        payload = validate_request(WORKSPACE, filename, testbench, top_module)
+    except (ValueError, OSError) as exc:
+        return f"Execution request refused: {exc}"
+    if payload["language"] == "python":
+        desc = f"execute Python file {payload['filename']} with local WSL permissions"
+    elif payload["testbench"]:
+        desc = (f"compile and simulate Verilog {payload['filename']} "
+                f"using {payload['testbench']} (top: {payload['top_module']})")
+    else:
+        desc = f"compile-check Verilog file {payload['filename']}"
+    return _request_approval("run_workspace_program", payload, desc)
+
+
 @function_tool
 def research_in_chrome(query: str, pages: int = 3) -> str:
     """Research 1–3 public pages in extension-created Chrome tabs. No personal tabs, forms, or downloads."""
@@ -781,6 +785,10 @@ jarvis = Agent(
         "Never claim a file exists unless a tool confirms it was created or read. "
         "If a tool reports a failure, explain the failure instead of claiming success. "
         "Do not repeat an action after it is queued; wait for approval. "
+        "To run Python or Verilog already saved in workspace, use run_workspace_program. "
+        "For Verilog simulation supply the testbench filename and its top module name. "
+        "Execution must be approved by the user first; report the approval ID. "
+        "Never say code ran successfully before an approved action returns its result. "
         "Screen vision uses a separate local Ollama vision model after approval. "
         "No deletion, arbitrary shell execution, email sending, or unrestricted mouse control. "
         "When the user provides a URL and requests a summary or analysis, "
@@ -802,7 +810,7 @@ jarvis = Agent(
     tools=[
         open_notepad, open_calculator, open_vscode,
         list_directory, read_file, search_files, get_system_info,
-        create_folder, create_file, write_file, type_in_notepad, inspect_screen, read_web_page, research_in_chrome, recall_user_memory
+        create_folder, create_file, write_file, run_workspace_program, type_in_notepad, inspect_screen, read_web_page, research_in_chrome, recall_user_memory
     ],
 )
 
