@@ -138,12 +138,12 @@ class TaskManager:
                 return f'Task planning stopped: {exc} No new files were created.'
 
     def start_repair_test(self, variant='semicolon'):
-        """Create a disposable project with an intentional compiler error.
+        """Create a disposable project with an intentional compiler or functional error.
 
         This only creates NEW files. Repairs and simulations use the normal
         approval workflow; existing projects are not modified.
         """
-        if variant not in ('semicolon', 'port', 'signal'):
+        if variant not in ('semicolon', 'port', 'signal', 'functional'):
             return 'Unknown repair test variant.'
         from core.jarvis_task_planner import _counter_plan
         if self.store.active():
@@ -169,6 +169,11 @@ class TaskManager:
             if source.count('.clk(clk)') != 1:
                 return 'Repair test unavailable: cannot locate port fixture.'
             tb[0]['content'] = source.replace('.clk(clk)', '.clock_invalid(clk)', 1)
+        elif variant == 'functional':
+            source = rtl[0]['content']
+            if source.count("count <= count + 4'd1;") != 1:
+                return 'Repair test unavailable: cannot locate counter increment fixture.'
+            rtl[0]['content'] = source.replace("count <= count + 4'd1;", "count <= count - 4'd1;", 1)
         else:
             source = rtl[0]['content']
             if source.count("count <= count + 4'd1;") != 1:
@@ -291,6 +296,15 @@ class TaskManager:
         match = re.search(r'(?:Simulation exit code|Exit code):\s*(-?\d+)', result)
         if result.startswith('Verilog compile FAILED'):
             return self._propose_repair(task_id, idx, task, result)
+        # Functional failures are not compilation errors. Only a nonzero Verilog
+        # simulation exit with an explicit self-checking failure may enter the
+        # supervised RTL repair path. Python and ambiguous failures remain terminal.
+        is_verilog = task['plan'].get('language') == 'verilog'
+        simulation_failed = (is_verilog and match is not None and
+                             int(match.group(1)) != 0 and
+                             bool(re.search(r'(?im)(?:^|\n)\s*(?:FATAL:|FAIL\b|ERROR\s*:)', result)))
+        if simulation_failed:
+            return self._propose_repair(task_id, idx, task, result, functional=True)
         if match is None or int(match.group(1)) != 0:
             self.store.update(task_id,status='failed',approval_id='',note='Execution failed; full diagnostics in the action history.')
             return f'Task `{task_id}` failed during execution. Review the action history.'
@@ -310,13 +324,13 @@ class TaskManager:
         if waveform:
             message += ' Waveform: ' + waveform.group(1)[:180]
         return message
-    def _propose_repair(self, task_id, idx, task, diagnostics):
-        """Compile failures only: propose a single-file repair for explicit approval."""
+    def _propose_repair(self, task_id, idx, task, diagnostics, functional=False):
+        """Propose a single-file supervised repair after verified compiler or simulation failure."""
         plan = task['plan']
         attempts = int(plan.get('_repair_attempts', 0))
         if attempts >= 2 or not self.model or not self.ollama_url:
             self.store.update(task_id, status='failed', approval_id='',
-                              note='Compilation still failed; automatic repair limit reached or model unavailable.')
+                              note='Verification failed; automatic repair limit reached or model unavailable.')
             return f'Task `{task_id}` failed compilation. Repair limit reached; diagnostics saved in action history.'
         try:
             from core.jarvis_task_repair import propose_verilog_repair
@@ -325,27 +339,36 @@ class TaskManager:
             for rel in (run['filename'], run['testbench']):
                 path = self._safe_target(rel)
                 sources[rel] = path.read_text(encoding='utf-8')
-            filename, corrected = propose_verilog_repair(
-                task['objective'], diagnostics, sources, self.model, self.ollama_url)
+            if functional:
+                from core.jarvis_functional_repair import propose_verilog_functional_repair
+                filename, corrected = propose_verilog_functional_repair(
+                    task['objective'], diagnostics, sources, run['filename'],
+                    run['testbench'], self.model, self.ollama_url)
+            else:
+                filename, corrected = propose_verilog_repair(
+                    task['objective'], diagnostics, sources, self.model, self.ollama_url)
             if filename not in sources or corrected == sources[filename]:
                 raise TaskError('Repair was unchanged or referenced an unknown file.')
             expected = hashlib.sha256(sources[filename].encode('utf-8')).hexdigest()
             payload = {'filename': filename, 'content': corrected,
                        '_expected_sha256': expected, '_task_repair': True,
                        '_task_id': task_id, '_task_step': idx,
-                       '_review': 'Compiler-directed repair. Review changes before approving.'}
+                       '_review': ('Functional simulation failed. Review the proposed RTL carefully; '
+                                   'compilation alone cannot guarantee correctness.' if functional else
+                                   'Compiler-directed repair. Review changes before approving.')}
             action_id = self.queue_approval('write_file', payload,
                 f'Task {task_id}: approve repair of {filename} (attempt {attempts + 1}/2)')
             plan['_repair_attempts'] = attempts + 1
             plan['_repair_stage'] = 'write'
             self.store.update(task_id, plan=plan, status='waiting_approval', approval_id=action_id,
-                note='Compiler error diagnosed. Proposed source replacement awaits approval.')
-            return (f'Task `{task_id}` could not compile. Proposed repair {attempts + 1}/2 '
+                note=('Functional mismatch diagnosed. Proposed RTL replacement awaits approval.' if functional else
+                      'Compiler error diagnosed. Proposed source replacement awaits approval.'))
+            return (f'Task `{task_id}` failed {"functional verification" if functional else "compilation"}. Proposed repair {attempts + 1}/2 '
                     f'awaits overwrite approval `{action_id}`; no file changed.')
         except Exception as exc:
             self.store.update(task_id, status='failed', approval_id='',
-                note=f'Compile failed; repair proposal unavailable: {type(exc).__name__}: {exc}'[:450])
-            return f'Task `{task_id}` failed compilation. Could not safely propose a repair: {exc}'
+                note=f'{"Functional test" if functional else "Compile"} failed; repair proposal unavailable: {type(exc).__name__}: {exc}'[:450])
+            return f'Task `{task_id}` failed {"functional verification" if functional else "compilation"}. Could not safely propose a repair: {exc}'
 
     def after_decision(self,action_id,approved,success,result):
         with self.lock():

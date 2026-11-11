@@ -362,13 +362,15 @@ def _task_command(message: str) -> str:
     manager = _task_manager()
     if not command or command.lower() == 'help':
         return ('Use /task followed by a Python or Verilog project objective. '
-                'Commands: /task status, /task resume, /task cancel, /task test-repair, /task test-repair-port, /task test-repair-signal.')
+                'Commands: /task status, /task resume, /task cancel, /task test-repair, /task test-repair-port, /task test-repair-signal, /task test-repair-functional.')
     if command.lower() == 'test-repair':
         return manager.start_repair_test()
     if command.lower() == 'test-repair-port':
         return manager.start_repair_test('port')
     if command.lower() == 'test-repair-signal':
         return manager.start_repair_test('signal')
+    if command.lower() == 'test-repair-functional':
+        return manager.start_repair_test('functional')
     if command.lower() == 'status':
         return manager.status()
     if command.lower() == 'resume':
